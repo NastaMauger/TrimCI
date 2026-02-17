@@ -62,3 +62,4 @@ tci = "trimci.TrimCI_runner.run_trimci:main"
 [tool.scikit-build]
 cmake.source-dir = "cpp/trimci_core"
 wheel.packages = ["py/trimci"]
+sdist.exclude = ["benchmark/**", "tutorial/**", "third_party/eigen/**", ".github/**"]
