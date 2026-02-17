@@ -53,7 +53,7 @@ DoubleExcTable precompute_double_exc_table(
     std::vector<std::vector<std::tuple<int,int,double>>> results(ij_pairs.size());
     
     #pragma omp parallel for schedule(dynamic)
-    for (size_t idx = 0; idx < ij_pairs.size(); ++idx) {
+    for (int64_t idx = 0; idx < (int64_t)ij_pairs.size(); ++idx) {
         int i = ij_pairs[idx].first;
         int j = ij_pairs[idx].second;
         std::vector<std::tuple<int,int,double>> entries;

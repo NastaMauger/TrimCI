@@ -521,7 +521,7 @@ run_trim_t(
         {
             std::vector<DeterminantT<StorageType>> local_sel;
             #pragma omp for schedule(dynamic)
-            for(size_t i=0; i<subsets.size(); ++i) {
+            for(int64_t i=0; i<(int64_t)subsets.size(); ++i) {
                 if(subsets[i].empty()) continue;
                 auto [e, c] = diagonalize_subspace_davidson_t(subsets[i], h1, eri, cache, quantization, 100, tol, false, n_orb, {}, sparsity_ptr);
                 auto top = select_top_k_dets_t(subsets[i], c, k, core_dets, false);
@@ -777,7 +777,7 @@ transform_integrals(
         // apply U_att @ (k, N²), and write back.
         
         #pragma omp parallel for
-        for(size_t i = 0; i < N; ++i) {
+        for(int64_t i = 0; i < (int64_t)N; ++i) {
             // Extract g[i, att, :, :] -> (k, N²)
             std::vector<double> slice_in(k * N2);
             for(int m = 0; m < k; ++m) {
@@ -808,7 +808,7 @@ transform_integrals(
         // g[i, j, att[m], l] = sum_{k in att} U_att^T[m, k] * g[i, j, att[k], l]
         
         #pragma omp parallel for
-        for(size_t i = 0; i < N; ++i) {
+        for(int64_t i = 0; i < (int64_t)N; ++i) {
             for(size_t j = 0; j < N; ++j) {
                 // Extract g[i, j, att, :] -> (k, N)
                 std::vector<double> slice_in(k * N);
@@ -835,7 +835,7 @@ transform_integrals(
         // g[i, j, k, att[m]] = sum_{l in att} U_att^T[m, l] * g[i, j, k, att[l]]
         
         #pragma omp parallel for
-        for(size_t i = 0; i < N; ++i) {
+        for(int64_t i = 0; i < (int64_t)N; ++i) {
             for(size_t j = 0; j < N; ++j) {
                 for(size_t kk = 0; kk < N; ++kk) {
                     // Extract g[i, j, k, att] -> (k, 1) = vector
@@ -884,7 +884,7 @@ transform_integrals(
             double* dst = p_out->data();
             
             #pragma omp parallel for
-            for (size_t p = 0; p < N; ++p) {
+            for (int64_t p = 0; p < (int64_t)N; ++p) {
                 for (size_t j = 0; j < N; ++j) {
                     for (size_t k = 0; k < N; ++k) {
                         for (size_t l = 0; l < N; ++l) {
@@ -995,7 +995,7 @@ std::vector<double> compute_fd_gradient_parallel_t(
     std::vector<double> energies_plus(n_active);
     
     #pragma omp parallel for schedule(dynamic)
-    for (size_t i = 0; i < n_active; ++i) {
+    for (int64_t i = 0; i < (int64_t)n_active; ++i) {
         int k = active_indices[i];
         
         // Perturb parameter k
