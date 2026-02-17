@@ -12,7 +12,7 @@ import json
 import argparse
 from pathlib import Path
 import shutil
-from .trimci_driver import run_full_calculation, run_auto
+from .trimci_driver import run_full_calculation, run_auto, load_configurations
 
 # Parser for --goal that supports abbreviations b/s/a
 def parse_goal(value: str) -> str:
@@ -189,7 +189,13 @@ def main():
     args, unknown_args = parser.parse_known_args()
 
     # Resolve FCIDUMP path
-    fcidump_path = Path(args.fcidump).resolve()
+
+    args_config = load_configurations(str(Path(args.fcidump).parent), args.trimci_config)
+
+    if getattr(args_config, 'fcidump_name', None) is None:
+        fcidump_path = Path(args.fcidump).resolve()
+    else:
+        fcidump_path = Path(args_config.fcidump_name).resolve()
 
     if not fcidump_path.exists():
         # Resolve FCIDUMP path
@@ -293,13 +299,17 @@ def main():
         "experimental_workflow": iteration_details
     }
 
+    report_name = getattr(args_config, 'report_name', "trimci_report")
+    pool_build_strategy = getattr(args_config, 'pool_build_strategy', "")
+    report_name = report_name + "_" + pool_build_strategy
+
     # Save markdown report
-    report_path = fcidump_path.parent / f"trimci_report_{timestamp.replace('-', '').replace(':', '').replace(' ', '_')}.md"
+    report_path = fcidump_path.parent / f"{report_name}_{timestamp.replace('-', '').replace(':', '').replace(' ', '_')}.md"
     generate_markdown_report(result_data, str(report_path), str(fcidump_path), vars(config))
     print(f"📄 Markdown report generated: {report_path}")
 
     # Save JSON result
-    json_path = fcidump_path.parent / f"trimci_result_{timestamp.replace('-', '').replace(':', '').replace(' ', '_')}.json"
+    json_path = fcidump_path.parent / f"{report_name}_{timestamp.replace('-', '').replace(':', '').replace(' ', '_')}.json"
     with open(json_path, "w", encoding="utf-8") as jf:
         json.dump(result_data, jf, indent=2)
     print(f"💾 JSON result saved: {json_path}")

@@ -54,6 +54,11 @@ class DeterminantTypeSelector:
             (64, "64"),    # Up to 64 orbitals: use Determinant64
             (128, "128"),  # 65-128 orbitals: use Determinant128  
             (192, "192"),  # 129-192 orbitals: use Determinant192
+            (256, "256"),  # 193-256 orbitals: use Determinant256
+            (320, "320"),  # 257-320 orbitals: use Determinant320
+            (384, "384"),  # 321-384 orbitals: use Determinant384
+            (448, "448"),  # 385-448 orbitals: use Determinant448
+            (512, "512"),  # 449-512 orbitals: use Determinant512
         ]
         
     def select_determinant_type(self, n_orb: int) -> str:
@@ -64,10 +69,10 @@ class DeterminantTypeSelector:
             n_orb: Number of orbitals in the system
             
         Returns:
-            String identifier for the determinant type ("64", "128", or "192")
+            String identifier for the determinant type ("64", "128", "192", etc.)
             
         Raises:
-            ValueError: If n_orb exceeds maximum supported orbitals (192)
+            ValueError: If n_orb exceeds maximum supported orbitals (512)
         """
         if n_orb <= 0:
             raise ValueError(f"Number of orbitals must be positive, got {n_orb}")
@@ -76,7 +81,7 @@ class DeterminantTypeSelector:
             if n_orb <= threshold:
                 return type_id
                 
-        raise ValueError(f"Number of orbitals {n_orb} exceeds maximum supported (192)")
+        raise ValueError(f"Number of orbitals {n_orb} exceeds maximum supported (512)")
     
     def get_function_mapping(self, n_orb: int) -> Dict[str, Callable]:
         """
@@ -167,13 +172,43 @@ class DeterminantTypeSelector:
                 "name": "Determinant128", 
                 "max_orbitals": 128,
                 "memory_per_det": 32,  # bytes
-                "description": "128-bit determinant for medium systems (recommended for 78 orbitals)"
+                "description": "128-bit determinant for medium systems"
             },
             "192": {
                 "name": "Determinant192",
                 "max_orbitals": 192, 
                 "memory_per_det": 48,  # bytes
                 "description": "192-bit determinant for large systems"
+            },
+            "256": {
+                "name": "Determinant256",
+                "max_orbitals": 256,
+                "memory_per_det": 64,
+                "description": "256-bit determinant for systems up to 256 orbitals"
+            },
+            "320": {
+                "name": "Determinant320",
+                "max_orbitals": 320,
+                "memory_per_det": 80,
+                "description": "320-bit determinant for systems up to 320 orbitals"
+            },
+            "384": {
+                "name": "Determinant384",
+                "max_orbitals": 384,
+                "memory_per_det": 96,
+                "description": "384-bit determinant for systems up to 384 orbitals"
+            },
+            "448": {
+                "name": "Determinant448",
+                "max_orbitals": 448,
+                "memory_per_det": 112,
+                "description": "448-bit determinant for systems up to 448 orbitals"
+            },
+            "512": {
+                "name": "Determinant512",
+                "max_orbitals": 512,
+                "memory_per_det": 128,
+                "description": "512-bit determinant for large scale systems"
             }
         }
         

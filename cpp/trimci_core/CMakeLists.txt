@@ -5,6 +5,26 @@ project(trimci_core LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Use LLVM's libc++ on macOS when compiling with LLVM clang
+# This is needed because LLVM clang may generate symbols not present in Apple's libc++
+if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # Check if we're using Homebrew LLVM
+    execute_process(
+        COMMAND ${CMAKE_CXX_COMPILER} --version
+        OUTPUT_VARIABLE CXX_COMPILER_VERSION
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if(CXX_COMPILER_VERSION MATCHES "Homebrew")
+        message(STATUS "Detected Homebrew LLVM, using LLVM libc++")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")
+        # Link to Homebrew LLVM's libc++
+        link_directories(/opt/homebrew/opt/llvm/lib/c++)
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L/opt/homebrew/opt/llvm/lib/c++ -Wl,-rpath,/opt/homebrew/opt/llvm/lib/c++")
+        set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -L/opt/homebrew/opt/llvm/lib/c++ -Wl,-rpath,/opt/homebrew/opt/llvm/lib/c++")
+    endif()
+endif()
+
 find_package(pybind11 CONFIG REQUIRED)
 
 # 1) Find Eigen3: prefer vendored third_party/eigen; then system; finally FetchContent
@@ -84,13 +104,12 @@ endif()
 pybind11_add_module(trimci_core
     determinant.cpp
     hamiltonian.cpp
+    iterative_workflow.cpp
     screening.cpp
     trim.cpp
+    davidson_gep.cpp
+    matfree_davidson.cpp
     pybind_wrapper.cpp
-    hamiltonian_scalable.cpp
-    screening_scalable.cpp
-    trim_scalable.cpp
-    pybind_wrapper_scalable.cpp
 )
 
 # Optional: Build scalable determinant example (for testing)

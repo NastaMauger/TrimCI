@@ -1,6 +1,6 @@
 """
 TrimCI driver script
-High-level workflow for running TrimCI from FCIDUMP or molecule.
+High-level workflow for running TrimCI.
 """
 import json, os, sys
 import logging
@@ -28,35 +28,31 @@ from trimci import (
 )
 
 # ========== Logging Configuration ==========
-LOG_FORMAT = "%(asctime)s: %(message)s"  # Removed levelname and milliseconds
-BLUE_COLOR = "\033[94m"
-RESET_COLOR = "\033[0m"
+# Colors for non-logging output
 RED_BOLD = "\033[1;31m"
 RESET = "\033[0m"
 
-def setup_logging(verbose: bool):
-    # Clear any existing handlers to avoid conflicts
-    logging.getLogger().handlers.clear()
-    
-    level = logging.INFO if verbose else logging.WARNING  # INFO for verbose, WARNING for non-verbose
-    class CleanFormatter(logging.Formatter):
-        def format(self, record):
-            # Custom format without milliseconds
-            record.asctime = self.formatTime(record, "%Y-%m-%d %H:%M:%S")
-            formatted = f"{record.asctime}: {record.getMessage()}"
-            return f"{BLUE_COLOR}{formatted}{RESET_COLOR}"
-    
-    logging.basicConfig(level=level, stream=sys.stdout, force=True)
-    for handler in logging.root.handlers:
-        handler.setFormatter(CleanFormatter())
+# Import unified logging functions
+from trimci.trimci_logging import setup_logging, log_important, log_verbose, get_verbosity_from_args
 
-def log_important(message: str):
-    """Log important messages that should always be shown"""
-    logging.warning(message)  # Use WARNING level to ensure it's always shown
 
-def log_verbose(message: str):
-    """Log verbose messages that are only shown when verbose=True"""
-    logging.info(message)  # Use INFO level for verbose-only messages
+def generate_unique_timestamp() -> str:
+    """
+    Generate a unique timestamp string for folder naming.
+    
+    Uses microsecond precision + PID to prevent collisions when multiple
+    jobs start simultaneously (e.g., Slurm array jobs).
+    
+    Format: YYYYMMDD_HHMMSSffffff_PID (6 digits microseconds + PID)
+    
+    Returns:
+        str: Unique timestamp like "20260125_033041123456_12345"
+    """
+    # Use full microseconds (6 digits) for uniqueness within same process
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S%f")  # Includes 6 digit microseconds
+    # Add PID for extra uniqueness in HPC environments (different Slurm jobs)
+    pid_suffix = f"_{os.getpid()}"
+    return ts + pid_suffix
 
 
 # ========== FCIDUMP Reading ==========
@@ -86,7 +82,7 @@ def read_fcidump(fcidump_path: str):
     n_alpha = int((n_elec + ms2) // 2)
     n_beta = int((n_elec - ms2) // 2)
 
-    log_important(f"🔍 Detected NORB={n_orb}, NELEC={n_elec}, N_ALPHA={n_alpha}, N_BETA={n_beta}, MS2={ms2}, PSYM={psym}")
+    log_verbose(f"🔍 Detected NORB={n_orb}, NELEC={n_elec}, N_ALPHA={n_alpha}, N_BETA={n_beta}, MS2={ms2}, PSYM={psym}")
 
     h1 = np.zeros((n_orb, n_orb))
     eri = np.zeros((n_orb, n_orb, n_orb, n_orb))
@@ -121,8 +117,7 @@ def read_fcidump(fcidump_path: str):
                 eri[s, r, p, q] = val
                 eri[r, s, q, p] = val
                 eri[s, r, q, p] = val
-    return h1, eri, n_elec, n_orb, nuclear_repulsion, n_alpha, n_beta
-
+    return h1, eri, n_elec, n_orb, nuclear_repulsion, n_alpha, n_beta, psym
 
 def read_fcidump2(fcidump_path: str):
     """
@@ -142,6 +137,10 @@ def read_fcidump2(fcidump_path: str):
     n_orb = fcidump_data['NORB']
     n_elec = fcidump_data['NELEC']
     nuclear_repulsion = fcidump_data['ECORE']
+    ms2 = fcidump_data['MS2']
+    n_alpha = int((n_elec + ms2) // 2)
+    n_beta = int((n_elec - ms2) // 2)
+    
     
     # Convert compressed ERI to 4D tensor format
     # PySCF returns ERI in compressed format, need to restore to (n_orb, n_orb, n_orb, n_orb)
@@ -149,16 +148,53 @@ def read_fcidump2(fcidump_path: str):
     
     log_verbose(f"🔍 Detected NORB={n_orb}, NELEC={n_elec}")
     
-    return h1, eri, n_elec, n_orb, nuclear_repulsion
-
-
+    return h1, eri, n_elec, n_orb, nuclear_repulsion, n_alpha, n_beta
 
 # ========== Main Workflow ==========
 def run_full(fcidump_path: str = None,
              molecule: str = None, basis: str = "sto-3g", spin: int = 0,
              trimci_config_path: str = None, config_dict: dict = None, **overrides):
     """
-    Convenience wrapper for run_full_calculation() that forwards all arguments unchanged.
+    MAIN ENTRY POINT for all TrimCI calculations.
+    
+    This function is the unified entry point that dispatches to different execution modes
+    based on configuration. All external scripts should call this function.
+    
+    Execution Branches & Log Files:
+    ================================
+    
+    1. PARALLEL MODE (n_parallel > 1)
+       → run_trimci_main_calculation() 
+         → run_trimci_main_calculation() → parallel [parallel_runner.py]
+       → Log: multi_summary.log
+       → Nests: single runs in subprocesses
+    
+    2. SEQUENTIAL MULTI-RUN MODE (n_parallel == 1, num_runs > 1)
+       → run_trimci_main_calculation()
+         → run_trimci_main_calculation_single() [multi-run branch]
+       → Log: multi_summary.log
+       → Nests: single runs sequentially
+    
+    3. SINGLE RUN MODE (n_parallel == 1, num_runs == 1)
+       → run_trimci_main_calculation()
+         → run_trimci_main_calculation_single() [single branch]
+       → Log: single_summary.log
+    
+    Nesting Structure:
+    ==================
+    multi_summary.log (parallel or sequential)
+    └── single_summary.log (per run, if verbose)
+    
+    Key Config Parameters:
+    =====================
+    - n_parallel: int → number of parallel workers (>1 enables parallel mode)
+    - num_runs: int → number of runs (>1 enables multi-run ensemble)
+    - threshold, pool_core_ratio, max_final_dets: TrimCI algorithm params
+    - core_set_schedule: list → determinant schedule e.g. [10, 100, 1000]
+    - initial_dets_dict: dict → initial determinant configuration
+    
+    Returns:
+        Tuple: (final_energy, dets, coeffs, details, run_args)
     """
     return run_full_calculation(fcidump_path=fcidump_path,
                                 molecule=molecule,
@@ -172,7 +208,7 @@ def run_full_calculation(fcidump_path: str = None,
                          molecule: str = None, basis: str = "sto-3g", spin: int = 0,
                          trimci_config_path: str = None, config_dict: dict = None, **overrides):
     """
-    Run calculation.
+    Internal implementation of run_full(). See run_full() for documentation.
     """
     if fcidump_path is None and molecule is None:
         raise ValueError("Either fcidump_path or molecule must be provided")
@@ -180,8 +216,35 @@ def run_full_calculation(fcidump_path: str = None,
         raise ValueError("fcidump_path and molecule are mutually exclusive")
 
     if fcidump_path:
-        h1, eri, n_elec, n_orb, nuclear_repulsion, n_alpha, n_beta = read_fcidump(fcidump_path)
+        h1, eri, n_elec, n_orb, nuclear_repulsion, n_alpha, n_beta, psym = read_fcidump(fcidump_path)
+
+        # Check for force_spinless override
+        force_spinless = overrides.get('force_spinless', False) or (config_dict and config_dict.get('force_spinless', False))
+        if force_spinless:
+            log_important(f"⚠️ Force spinless mode enabled: Setting n_beta=0, n_alpha={n_elec}")
+            n_alpha = n_elec
+            n_beta = 0
+
         args = load_configurations(str(Path(fcidump_path).parent), trimci_config_path)
+        # if getattr(args, "debug", False):
+        #     print("debug mode enabled")
+        #     h1_pyscf, eri_pyscf, n_elec_pyscf, n_orb_pyscf, nuclear_repulsion_pyscf, n_alpha_pyscf, n_beta_pyscf = read_fcidump2(fcidump_path)
+        #     print(f"🔍 Debug mode enabled. Using PySCF FCIDUMP reader.")
+        #     print(f"🔍 Detected NORB={n_orb_pyscf}, NELEC={n_elec_pyscf}")
+        #     # Compare results from the two FCIDUMP readers
+        #     if not np.allclose(h1, h1_pyscf):
+        #         print(f"{RED_BOLD}WARNING: H1 integrals differ between custom and PySCF FCIDUMP readers!{RESET}")
+        #         print(f"  Max absolute difference in H1: {np.max(np.abs(h1 - h1_pyscf)):.6e}")
+        #     if not np.allclose(eri, eri_pyscf):
+        #         print(f"{RED_BOLD}WARNING: ERI integrals differ between custom and PySCF FCIDUMP readers!{RESET}")
+        #         print(f"  Max absolute difference in ERI: {np.max(np.abs(eri - eri_pyscf)):.6e}")
+        #     if not np.isclose(nuclear_repulsion, nuclear_repulsion_pyscf):
+        #         print(f"{RED_BOLD}WARNING: Nuclear repulsion energy differs between custom and PySCF FCIDUMP readers!{RESET}")
+        #         print(f"  Custom: {nuclear_repulsion:.6f}, PySCF: {nuclear_repulsion_pyscf:.6f}")
+
+        #     # Use PySCF's parsed values for the rest of the calculation if debug is on
+        #     h1, eri, n_elec, n_orb, nuclear_repulsion, n_alpha, n_beta = h1_pyscf, eri_pyscf, n_elec_pyscf, n_orb_pyscf, nuclear_repulsion_pyscf, n_alpha_pyscf, n_beta_pyscf
+
         # Apply explicit config dictionary if provided (higher precedence than file)
         if config_dict:
             for key, value in config_dict.items():
@@ -189,6 +252,10 @@ def run_full_calculation(fcidump_path: str = None,
         # Override parameters
         for key, value in overrides.items():
             setattr(args, key, value)
+        args.psym = psym
+        # Add source info to args for logging
+        args.fcidump_path = fcidump_path
+        args.nuclear_repulsion = nuclear_repulsion
         # Setup logging based on config
         #n_alpha = n_beta = n_elec // 2
         mol_name = f"FCIDUMP_{n_elec}e_{n_orb}o"
@@ -214,6 +281,9 @@ def run_full_calculation(fcidump_path: str = None,
 
         for key, value in overrides.items():
             setattr(args, key, value)
+        # Add source info to args for logging
+        args.molecule_spec = molecule
+        args.nuclear_repulsion = nuclear_repulsion
 
     setup_logging(args.verbose)
     # Write run_full start block to realtime_progress.out
@@ -229,10 +299,55 @@ def run_full_calculation(fcidump_path: str = None,
     except Exception:
         # Non-fatal: ignore file writing errors
         pass
-    print(args)
+    verbosity = getattr(args, 'verbosity', 1 if getattr(args, 'verbose', False) else 0)
+    if verbosity >= 1:
+        print(args)
     n_total = int(comb(n_orb, n_alpha) * comb(n_orb, n_beta))
 
+    # Auto-determine max_final_dets if set to "auto"
+    # Target: ~10s on modern laptop. Heuristic based on Davidson O(n_dets^2 * n_orb^2)
+    max_final_dets = getattr(args, 'max_final_dets', None)
+    if max_final_dets == "auto" or max_final_dets == -1:
+        # Empirical formula: scales inversely with n_orb^1.5
+        # n_orb=10 → ~300 dets, n_orb=20 → ~100 dets, n_orb=40 → ~35 dets
+        auto_dets = int(3000 / (n_orb ** 1.5))
+        auto_dets = max(50, min(500, auto_dets))  # Clamp to [50, 500]
+        auto_dets = min(auto_dets, n_total)  # Don't exceed total possible
+        log_important(f"🔧 max_final_dets='auto': n_orb={n_orb} → max_final_dets={auto_dets}")
+        args.max_final_dets = auto_dets
+    elif max_final_dets is not None and max_final_dets > n_total:
+        # Guard: auto-adjust if exceeds maximum possible determinants
+        log_important(f"⚠️ max_final_dets ({max_final_dets}) exceeds total ({n_total}). Adjusting to {n_total}.")
+        args.max_final_dets = n_total
 
+    return run_trimci_main_calculation(h1, eri, n_alpha, n_beta, n_orb, mol_name, args, nuclear_repulsion)
+
+
+def run_trimci_main_calculation(h1, eri, n_alpha, n_beta, n_orb, mol_name, args, nuclear_repulsion, folder=None):
+    """
+    Smart wrapper that dispatches to single or parallel execution based on args.n_parallel.
+    
+    If args.n_parallel > 1, uses spawn subprocesses for parallel execution.
+    Otherwise, uses the single-threaded version.
+    """
+    n_parallel = getattr(args, 'n_parallel', 1)
+    
+    if n_parallel > 1:
+        # Use parallel version
+        from .parallel_runner import run_trimci_main_calculation_parallel
+        return run_trimci_main_calculation_parallel(
+            h1, eri, n_alpha, n_beta, n_orb, mol_name, args, nuclear_repulsion,
+            folder=folder,
+            num_runs=getattr(args, 'num_runs', 50),
+            n_parallel=n_parallel,
+            omp_per_run=getattr(args, 'omp_per_run', None)
+        )
+    else:
+        # Use single-threaded version
+        return run_trimci_main_calculation_single(h1, eri, n_alpha, n_beta, n_orb, mol_name, args, nuclear_repulsion, folder)
+
+
+def run_trimci_main_calculation_single(h1, eri, n_alpha, n_beta, n_orb, mol_name, args, nuclear_repulsion, folder=None):
     # Check if multiple runs are requested
     num_runs = getattr(args, 'num_runs', 1)
     
@@ -244,6 +359,28 @@ def run_full_calculation(fcidump_path: str = None,
         best_result = None
         all_results = []
         all_results_dirs = []
+
+        unique_ts = generate_unique_timestamp()
+        if folder is None:
+            multi_run_folder = str(Path("trimci_multi_run_results") / f"{mol_name}_{unique_ts}")
+        else:
+            multi_run_folder = str(Path(folder) / f"multi_{mol_name}_{unique_ts}")
+        
+        # Setup file logging
+        Path(multi_run_folder).mkdir(parents=True, exist_ok=True)
+        log_file = os.path.join(multi_run_folder, "realtime_progress.log")
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.WARNING)
+        file_handler.setFormatter(logging.Formatter("%(asctime)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+        logging.getLogger().addHandler(file_handler)
+        
+        # Setup unified summary log using TrimCISummaryLogger
+        from .summary_logger import TrimCISummaryLogger
+        args_dict = vars(args).copy() if hasattr(args, '__dict__') else dict(args)
+        summary_logger = TrimCISummaryLogger(os.path.join(multi_run_folder, "multi_summary.log"), mode="multi")
+        summary_logger.write_header(mol_name, n_orb, n_alpha, n_beta, args_dict, num_runs=num_runs)
+        
+        multi_start_time = time.perf_counter()
         
         for run_idx in range(num_runs):
             start_total = time.perf_counter()
@@ -251,7 +388,7 @@ def run_full_calculation(fcidump_path: str = None,
             
             # Run the calculation
             final_energy, current_dets, current_coeffs, iteration_details, run_args = iterative_workflow(
-                h1, eri, n_alpha, n_beta, n_orb, mol_name, args, nuclear_repulsion, start_total
+                h1, eri, n_alpha, n_beta, n_orb, mol_name, args, nuclear_repulsion, start_total, multi_run_folder
             )
             
             # Store result and results directory
@@ -269,6 +406,11 @@ def run_full_calculation(fcidump_path: str = None,
             all_results_dirs.append(results_dir)
             
             log_important(f"✅ Run {run_idx + 1} completed with energy: {final_energy:.8f}")
+
+            # Log to summary using TrimCISummaryLogger
+            run_elapsed = time.perf_counter() - start_total
+            n_iters = iteration_details.get('total_iterations')
+            summary_logger.log_run_complete(run_idx + 1, final_energy, run_elapsed, n_iters)
             
             # Check if this is the best result so far
             if final_energy < best_energy:
@@ -287,18 +429,158 @@ def run_full_calculation(fcidump_path: str = None,
         log_important(f"🎯 Best result from run {best_result['run_idx']} with energy: {best_result['final_energy']:.8f}")
         
         # Clean up non-best results directories
-        best_results_dir = best_result['results_dir']
+        # Sort results by energy
+        all_results.sort(key=lambda x: x['final_energy'])
+        
+        num_keep = getattr(args, 'num_runs_keep_top_k', 1)
+        top_k_results = all_results[:num_keep]
+        top_k_indices = set(r['run_idx'] for r in top_k_results)
+        
+        log_important(f"🧹 Keeping top {num_keep} results (Runs: {sorted(list(top_k_indices))})")
+
         for result in all_results:
-            if result['run_idx'] != best_result['run_idx'] and result['results_dir']:
+            if result['run_idx'] not in top_k_indices and result['results_dir']:
                 try:
                     if os.path.exists(result['results_dir']):
                         shutil.rmtree(result['results_dir'])
-                        log_verbose(f"🗑️ Removed non-best results directory: {result['results_dir']}")
+                        log_verbose(f"🗑️ Removed non-top-{num_keep} results directory: {result['results_dir']}")
                 except Exception as e:
                     log_verbose(f"⚠️ Failed to remove directory {result['results_dir']}: {e}")
         
+        # Combine determinants from top k results
+        if num_keep > 0:
+            log_important(f"🧩 Combining determinants from top {num_keep} runs...")
+            
+            # Dictionary to store unique determinants and their coefficients
+            # Key: (alpha, beta) tuple, Value: (determinant object, coefficient)
+            unique_dets_map = {}
+            
+            # Iterate through results (already sorted by energy)
+            for result in top_k_results:
+                current_dets = result['current_dets']
+                current_coeffs = result['current_coeffs']
+                
+                for det, coeff in zip(current_dets, current_coeffs):
+                    # Normalize to tuple for map key
+                    if isinstance(det.alpha, list):
+                        key = (tuple(det.alpha), tuple(det.beta))
+                    else:
+                        key = (det.alpha, det.beta)
+                    
+                    # If not present, add it. Since results are sorted by energy, 
+                    # we keep the coefficient from the best run that had this determinant.
+                    if key not in unique_dets_map:
+                        unique_dets_map[key] = (det, coeff)
+            
+            unique_dets_list = [v[0] for v in unique_dets_map.values()]
+            unique_coeffs_list = [v[1] for v in unique_dets_map.values()]
+            
+            log_important(f"🧩 Combined {len(unique_dets_list)} unique determinants.")
+            
+            # Check if renormalization is requested
+            if getattr(args, 'num_runs_keep_top_renormalize', False):
+                log_important("🔄 Renormalizing combined determinants using trim()...")
+                try:
+                    # Prepare arguments for trim
+                    # We use get_functions_for_system to get the correct run_trim function
+                    # and handle potential version mismatch regarding the 'tol' parameter
+                    
+                    funcs = get_functions_for_system(n_orb)
+                    run_trim_func = funcs['run_trim']
+                    
+                    # We want to keep all of them, so keep_size = len(unique_dets_list)
+                    # group_size = 1 as requested
+                    group_sizes = [1]
+                    keep_sizes = [len(unique_dets_list)]
+                    
+                    # Try calling with tol (new version)
+                    try:
+                        t_energy, t_dets, t_coeffs = run_trim_func(
+                            unique_dets_list, h1, eri, mol_name, n_alpha+n_beta, n_orb,
+                            group_sizes, keep_sizes, 
+                            False, False, [], 1e-3
+                        )
+                    except TypeError:
+                        # Fallback to old version without tol
+                        t_energy, t_dets, t_coeffs = run_trim_func(
+                            unique_dets_list, h1, eri, mol_name, n_alpha+n_beta, n_orb,
+                            group_sizes, keep_sizes, 
+                            False, False, []
+                        )
+                    
+                    # Update coefficients and determinants
+                    unique_dets_list = t_dets
+                    unique_coeffs_list = t_coeffs
+                    log_important(f"✅ Renormalization complete. Energy: {t_energy:.8f}")
+                    
+                except Exception as e:
+                    log_important(f"⚠️ Renormalization failed: {e}")
+                    # Fallback to simple normalization
+                    norm = np.linalg.norm(unique_coeffs_list)
+                    if norm > 1e-12:
+                        unique_coeffs_list = [c/norm for c in unique_coeffs_list]
+                    log_important("⚠️ Used simple normalization instead.")
+            else:
+                # Simple normalization if not re-optimizing
+                norm = np.linalg.norm(unique_coeffs_list)
+                if norm > 1e-12:
+                    unique_coeffs_list = [c/norm for c in unique_coeffs_list]
+            
+            # Save combined determinants
+            dets_combine_path = os.path.join(multi_run_folder, "dets_combine.npz")
+            try:
+                # Format matching save_final_results but without core_set/core_set_coeffs
+                # np.savez_compressed(npz_path,
+                #                     dets=dets_to_array(current_dets),
+                #                     dets_coeffs=np.array(final_coeffs),
+                #                     core_set_coeffs=np.array(current_coeffs),
+                #                     core_set=dets_to_array(current_core_set))
+                
+                np.savez_compressed(dets_combine_path, 
+                                    dets=dets_to_array(unique_dets_list),
+                                    dets_coeffs=np.array(unique_coeffs_list))
+                log_important(f"💾 Saved combined determinants to {dets_combine_path}")
+            except Exception as e:
+                log_important(f"⚠️ Failed to save combined determinants: {e}")
+            
+            # Save individual run dets/coeffs for NOCI downstream use
+            dets_multi_run_path = os.path.join(multi_run_folder, "dets_multi_run.npz")
+            try:
+                # Build list of wavefunctions, each as a dict with dets, coeffs, energy
+                all_wfs = []
+                for result in top_k_results:
+                    wf_data = {
+                        'dets': dets_to_array(result['current_dets']),
+                        'coeffs': np.array(result['current_coeffs']),
+                        'energy': result['final_energy'],
+                        'n_dets': len(result['current_dets'])
+                    }
+                    all_wfs.append(wf_data)
+                
+                np.savez_compressed(dets_multi_run_path, 
+                                    all_wfs=np.array(all_wfs, dtype=object),
+                                    n_wfs=num_keep,
+                                    energies=np.array([r['final_energy'] for r in top_k_results]))
+                log_important(f"💾 Saved {num_keep} wavefunctions to {dets_multi_run_path}")
+            except Exception as e:
+                log_important(f"⚠️ Failed to save multi-run dets: {e}")
+        
+        # Prepare combined results info
+        combined_results_info = {
+            'num_combined_dets': len(unique_dets_list),
+            'renormalized': getattr(args, 'num_runs_keep_top_renormalize', False),
+            'file_path': dets_combine_path
+        }
+        if getattr(args, 'num_runs_keep_top_renormalize', False) and 't_energy' in locals():
+            combined_results_info['renormalized_energy'] = t_energy
+            
+        # Calculate top 10 determinants for combined results
+        combined_results_info['top_10_determinants'] = get_top_determinants(unique_dets_list, unique_coeffs_list, top_n=10)
+        
         # Generate multi-run report
-        generate_multi_run_report(all_results, best_result, mol_name, args)
+        generate_multi_run_report(all_results, best_result, mol_name, args, 
+                                  folder=multi_run_folder, 
+                                  combined_results_info=combined_results_info)
         
         # Mark RUN_FULL end with summary
         try:
@@ -310,6 +592,18 @@ def run_full_calculation(fcidump_path: str = None,
             # Non-fatal: ignore file writing errors
             pass
         
+        # Write final summary to multi_summary.log
+        total_elapsed = time.perf_counter() - multi_start_time
+        # Add elapsed time to each result for summary
+        for r in all_results:
+            r['elapsed'] = r.get('elapsed', 0)
+        summary_logger.write_multi_summary(all_results, best_result, total_elapsed)
+        summary_logger.close()
+        
+        # Teardown file logging
+        logging.getLogger().removeHandler(file_handler)
+        file_handler.close()
+
         # Return the best result
         return (best_result['final_energy'], best_result['current_dets'], 
                 best_result['current_coeffs'], best_result['iteration_details'], 
@@ -317,30 +611,57 @@ def run_full_calculation(fcidump_path: str = None,
     else:
         # Single run
         start_total = time.perf_counter()
+        if folder is None:
+            single_run_folder = str(Path("trimci_single_run_results"))
+        else:
+            single_run_folder = str(Path(folder))
+
+        # Setup file logging
+        Path(single_run_folder).mkdir(parents=True, exist_ok=True)
+        log_file = os.path.join(single_run_folder, "realtime_progress.log")
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.WARNING)
+        file_handler.setFormatter(logging.Formatter("%(asctime)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+        logging.getLogger().addHandler(file_handler)
+        
+        # Setup single_summary.log
+        from .summary_logger import TrimCISummaryLogger
+        args_dict = vars(args).copy() if hasattr(args, '__dict__') else dict(args)
+        summary_logger = TrimCISummaryLogger(os.path.join(single_run_folder, "single_summary.log"), mode="single")
+        summary_logger.write_header(mol_name, n_orb, n_alpha, n_beta, args_dict)
+        
         _fe, _cd, _cc, _id, _ra = iterative_workflow(h1, eri, n_alpha, n_beta, n_orb, mol_name,
-                                  args, nuclear_repulsion, start_total)
-        # Record FINAL RUN END
+                                  args, nuclear_repulsion, start_total, single_run_folder)
+        
+        _elapsed = time.perf_counter() - start_total
+        n_dets = len(_cd) if _cd else 0
+        n_iters = _id.get('total_iterations', 0)
+        
+        # Write single_summary.log
+        summary_logger.write_single_summary(_fe, n_dets, n_iters, _elapsed, _id.get('results_dir', ''))
+        summary_logger.close()
+        
+        # Record FINAL RUN END (legacy)
         try:
             _ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            _elapsed = time.perf_counter() - start_total
             with open("realtime_progress.out", "a", encoding="utf-8") as f:
                 f.write(f"---- [ {_ts} ] FINAL RUN END ----\n")
                 f.write(f"label: single | energy: {_fe:.8f} | ndets: {getattr(args, 'max_final_dets', 'N/A')} | elapsed_s: {_elapsed:.2f}\n")
         except Exception:
-            # Non-fatal: ignore file writing errors
             pass
-        # Mark RUN_FULL END
+        # Mark RUN_FULL END (legacy)
         try:
             _ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open("realtime_progress.out", "a", encoding="utf-8") as f:
                 f.write(f"==== [ {_ts} ] RUN_FULL END ====\n")
                 f.write(f"Summary: single | energy: {_fe:.8f} | kept_dir: {_id.get('results_dir', '')}\n\n")
         except Exception:
-            # Non-fatal: ignore file writing errors
             pass
+        # Teardown file logging
+        logging.getLogger().removeHandler(file_handler)
+        file_handler.close()
         return (_fe, _cd, _cc, _id, _ra)
 
-# ========== Auto Runner ==========
 def run_auto(fcidump_path: str = None,
              molecule: str = None, basis: str = "sto-3g", spin: int = 0,
              goal: str = "balanced",
@@ -380,7 +701,15 @@ def run_auto(fcidump_path: str = None,
     
     # --- Prepare system data ---
     if fcidump_path:
-        h1, eri, n_elec, n_orb, nuclear_repulsion, n_alpha, n_beta = read_fcidump(fcidump_path)
+        h1, eri, n_elec, n_orb, nuclear_repulsion, n_alpha, n_beta, _ = read_fcidump(fcidump_path)
+
+        # Check for force_spinless override
+        force_spinless = overrides.get('force_spinless', False) or (config_dict and config_dict.get('force_spinless', False))
+        if force_spinless:
+            log_important(f"⚠️ Force spinless mode enabled: Setting n_beta=0, n_alpha={n_elec}")
+            n_alpha = n_elec
+            n_beta = 0
+
         config_dir = str(Path(fcidump_path).parent)
         args = load_configurations(config_dir, trimci_config_path, save_if_not_exist=False)
         mol_name = f"FCIDUMP_{n_elec}e_{n_orb}o"
@@ -520,7 +849,9 @@ def run_auto(fcidump_path: str = None,
             exploration_ndets = max(1000, int(ndets ** 0.5))
 
     for k, v in overrides.items():
-        print(k)
+        _verbosity = getattr(baseline, 'verbosity', 1 if getattr(baseline, 'verbose', False) else 0)
+        if _verbosity >= 1:
+            print(k)
         if k == "max_final_dets":
             continue
         elif k == "explore_final_dets":
@@ -769,114 +1100,214 @@ def run_auto(fcidump_path: str = None,
             pass
         return (_fe, _cd, _cc, _id, _ra)
 
-# ========== Iterative Workflow ==========
-def iterative_workflow(h1, eri, n_alpha, n_beta, n_orb,
-                       mol_name, args, nuclear_repulsion, start_total):
+# ========== Basic Workflow ==========
+def iterative_workflow_py(h1, eri, n_alpha, n_beta, n_orb,
+                       system_name, args, nuclear_repulsion,
+                       start_time=None, results_dir="trimci_results"):
+    """
+    Main TrimCI iterative workflow.
+    
+    This function implements the core TrimCI algorithm: an iterative method 
+    that efficiently builds a compact, variationally CI-based wavefunction.
+    
+    Algorithm Overview:
+    ===================
+    STEP 0: Core Set Initialization
+            Initialize starting determinants from file, dict, or HF reference.
+    
+    [BEGIN ITERATIVE LOOP]
+        STEP 1: Pool Construction via Heat-Bath Screening
+                Expand core set by generating connected determinants with H_ij*c_j weighting.
+        
+        STEP 2: Local Trim Parameter Setup
+                Configure hierarchical trimming (m groups, k survivors per group).
+        
+        STEP 3: Subspace Diagonalization & Selection (TRIM Core)
+                Partition → Diagonalize → Keep top-k → Merge → Re-diagonalize.
+        
+        STEP 4: Energy Accounting & Statistics
+                Compute E_total, track ΔE (decision in STEP 6).
+        
+        STEP 5: Core Set Growth & Preparation for Next Iteration
+                Sort by |c_i|, grow core set (via schedule or ratio), normalize.
+        
+        STEP 6: Termination Conditions
+                Break if converged, schedule exhausted, max_iterations, or max_final_dets.
+    [END ITERATIVE LOOP]
+    
+    FINALIZATION: Post-Processing & Result Assembly
+                  Run final Davidson on core set, save results to disk.
+    
+    Args:
+        h1: One-body integrals (n_orb x n_orb)
+        eri: Two-body integrals (flattened or 4D)
+        n_alpha, n_beta: Number of alpha/beta electrons
+        n_orb: Number of orbitals
+        system_name: System identifier for logging and file naming (e.g., "H6", "Fe4S4")
+        args: Configuration namespace with workflow parameters
+            Key parameters:
+            - core_set_schedule: List[int], optional. Explicit core set sizes per iteration.
+                Example: [10, 20, 50, 100] -> iter 1: 10 dets, iter 2: 20 dets, etc.
+                When provided, overrides core_set_ratio. Workflow terminates when exhausted.
+            - core_set_ratio: float or List[float]. Growth factor per iteration (default).
+            - max_final_dets: int. Hard limit on core set size (ignored if schedule is provided).
+            - threshold: float. Heat-bath screening threshold.
+        nuclear_repulsion: Nuclear repulsion energy
+        start_total: Start time for timing
+        results_dir: Output directory
+    
+    Returns:
+        (final_energy, dets, coeffs, iteration_details, args)
+        
+        dets:   List of determinants (sorted by |coeff|)
+        coeffs: List of CI coefficients (sorted by |coeff|)
+    """
+    # Handle start_time = None (default to current time)
+    if start_time is None:
+        start_time = time.perf_counter()
+    
+    # Deprecation warning
+    import warnings
+    warnings.warn(
+        "iterative_workflow_py is deprecated. Use iterative_workflow() which calls C++ backend.",
+        DeprecationWarning,
+        stacklevel=2
+    )
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S%f")[:-3]
-    results_dir = str(Path("trimci_results") / f"{mol_name}_{timestamp}")
+    unique_ts = generate_unique_timestamp()
+    results_dir = str(Path(results_dir) / f"{system_name}_{unique_ts}")
     Path(results_dir).mkdir(parents=True, exist_ok=True)
     log_verbose(f"📁 Results will be saved in: {results_dir}")
 
-    # workflow parameters
+    # Flatten ERI if needed (for C++ core compatibility)
+    if hasattr(eri, "reshape") and hasattr(eri, "ndim") and eri.ndim == 4:
+        eri = eri.reshape(-1)
+        log_verbose("ℹ️  Flattened ERI tensor for C++ core.")
+
+    # =========================================================================
+    # Parameter Extraction from args
+    # =========================================================================
+    
+    # --- Termination Conditions ---
     max_iterations = getattr(args, 'max_iterations', 
                              getattr(args, 'exp_max_iterations', -1))
     energy_threshold = getattr(args, 'energy_threshold',
                                getattr(args, 'exp_energy_threshold', 1e-12))
-    
-    initial_pool_size = getattr(args, 'initial_pool_size', 100)
-    _core_set_ratio = getattr(args, 'core_set_ratio', 2)
     max_final_dets = getattr(args, 'max_final_dets', None)
+
+    # Handle max_iterations = -1 (unlimited, rely on other termination conditions)
+    if max_iterations == -1:
+        if max_final_dets is None and core_set_schedule is None:
+            raise ValueError("max_iterations=-1 requires max_final_dets or core_set_schedule")
+        max_iterations = 200000  # Safety cap
+
+    # --- Core Set Growth ---
+    _core_set_ratio = getattr(args, 'core_set_ratio', 2)
+    initial_pool_size = getattr(args, 'initial_pool_size', 100)
+
+    # Core set schedule: explicit list of core sizes per iteration
+    # e.g., [10, 20, 50, 100] means: after iter 1 -> 10 dets, iter 2 -> 20 dets, etc.
+    # When the schedule is exhausted, the workflow terminates.
+    core_set_schedule = getattr(args, 'core_set_schedule', None)
+    if core_set_schedule is not None:
+        core_set_schedule = list(core_set_schedule)  # Ensure it's a mutable list
+        log_important(f"📋 Using core_set_schedule: {core_set_schedule}")
+
+    # --- Pool Building (STEP 1) ---
     pool_core_ratio = getattr(args, 'pool_core_ratio', 10)
-    max_rounds = getattr(args, 'max_rounds', 1)
     pool_build_strategy = getattr(args, 'pool_build_strategy', 'heat_bath')
-    num_groups = getattr(args, 'num_groups', 10)
+    threshold = getattr(args, 'threshold', 0.01)  # Heat-bath screening threshold
+    threshold_decay = getattr(args, 'threshold_decay', 0.9)
+    max_rounds = getattr(args, 'max_rounds', 1)
+    # Attentive TrimCI: restrict excitations to specific orbitals
+    attentive_orbitals = getattr(args, 'attentive_orbitals', None)
+    # Strategy factor: pre-filter multiplier for PT2 modes
+    # -1 = automatic (1 for heat_bath, 20 for PT2 modes)
+    strategy_factor = getattr(args, 'strategy_factor', -1)
+    
+    # DMRG-style noise injection for escaping local minima
+    # noise_strength > 0 adds Gaussian noise to coefficients before sorting
+    # Typical values: 0.01-0.1 for early phases, 0 for final phases
+    noise_strength = getattr(args, 'noise_strength', 0.0)
+    
+    # --- TRIM Parameters (STEP 2-3) ---
+    num_groups_base = getattr(args, 'num_groups', 10)
+    # num_groups_ratio: when > 0, num_groups = max(num_groups, core_set_size * ratio)
+    # This allows adaptive group count scaling with wavefunction size
+    num_groups_ratio = getattr(args, 'num_groups_ratio', 0)
+    # local_trim_keep_ratio: total raw_dets = core_set * ratio, then k = raw_dets / num_groups
+    local_trim_keep_ratio = getattr(args, 'local_trim_keep_ratio',
+                                    getattr(args, 'keep_pool_to_next_core_ratio', 0))
+    keep_ratio = getattr(args, 'keep_ratio', 0.1)  # Legacy, prefer local_trim_keep_ratio
+
+    # --- Saving & Debug ---
     save_period = getattr(args, 'save_period', 50)
-    keep_pool_to_next_core_ratio = getattr(args, 'local_trim_keep_ratio',
-                                           getattr(args, 'keep_pool_to_next_core_ratio', 0))
-    debug = getattr(args, 'debug', False)
     save_initial = getattr(args, 'save_initial', False)
     save_pool = getattr(args, 'save_pool', False)
-    threshold = getattr(args, 'threshold', False)
-    keep_ratio = getattr(args, 'keep_ratio', 0.1) # not recommended; use local_trim_keep_ratio instead
+    debug = getattr(args, 'debug', False)
+    
 
-    # Special case: unlimited iterations
-    if max_iterations == -1:
-        if max_final_dets is None:
-            raise ValueError("When exp_max_iterations = -1, max_final_dets must be specified")
-        max_iterations = 200000
-        log_verbose(f"🧪 Workflow (controlled by max_final_dets={max_final_dets}, "
-                     f"energy_thresh={energy_threshold})")
-    else:
-        if max_final_dets is not None:
-            log_verbose(f"🧪 Workflow (max_iter={max_iterations}, "
-                         f"max_final_dets={max_final_dets}, energy_thresh={energy_threshold})")
-        else:
-            log_verbose(f"🧪 Workflow (max_iter={max_iterations}, energy_thresh={energy_threshold})")
 
-    # Initialize reference determinant and core set
+
+
+
+
+    # =============================================================================
+    # STEP 0: Core Set Initialization
+    # =============================================================================
+    # Initialize the starting determinants for the iterative TrimCI algorithm.
+    # Sources (in priority order):
+    #   1. Load from file if load_initial_dets=True
+    #   2. Generate from initial_dets_dict (e.g., HF + random configurations)
+    #   3. Fallback to single reference (HF) determinant
+    load_initial_dets_num = getattr(args, 'load_initial_dets_num', None)  # None = load all
+    
     if getattr(args, 'load_initial_dets', False):
-        # Try to load from dets.npz file
         dets_path = getattr(args, "initial_dets_path", "dets.npz")
-        log_important(f"🔄 Loading initial determinants from dets.npz")
+        log_important(f"🔄 Loading initial determinants from {dets_path}")
         dets_array_name = getattr(args, "dets_array_name", "dets")
-        if dets_array_name == "dets":
-            loaded_core_set, loaded_coeffs = load_initial_dets_from_file(dets_path, core_set=False)
-        else:
-            loaded_core_set, loaded_coeffs = load_initial_dets_from_file(dets_path, core_set=True)
+        loaded_core_set, loaded_coeffs = load_initial_dets_from_file(
+            dets_path, core_set=(dets_array_name != "dets"))
             
         if loaded_core_set is not None and loaded_coeffs is not None:
+            # Apply top-k truncation if load_initial_dets_num is specified
+            if load_initial_dets_num is not None and load_initial_dets_num < len(loaded_core_set):
+                original_count = len(loaded_core_set)
+                # Sort by |coefficient| descending and take top-k
+                sorted_idx = np.argsort(np.abs(loaded_coeffs))[::-1][:load_initial_dets_num]
+                loaded_core_set = [loaded_core_set[i] for i in sorted_idx]
+                loaded_coeffs = [loaded_coeffs[i] for i in sorted_idx]
+                log_important(f"✅ Loaded top-{load_initial_dets_num} determinants (truncated from {original_count})")
+            else:
+                log_important(f"✅ Loaded {len(loaded_core_set)} determinants")
             current_core_set = loaded_core_set
-            current_coeffs = loaded_coeffs
-            log_important(f"✅ Loaded {len(current_core_set)} determinants from dets.npz")
+            current_core_coeffs = loaded_coeffs
         else:
-            # Fallback to reference determinant if loading fails
             det_ref = generate_reference_det(n_alpha, n_beta, n_orb)
             log_important(f"🔄 Fallback to reference determinant: {det_ref}")
             current_core_set = [det_ref]
-            current_coeffs = [1.0]
-        
+            current_core_coeffs = [1.0]
     else:
         init_dict = getattr(args, "initial_dets_dict", None)
         if init_dict:
-            current_core_set, current_coeffs = generate_initial_states(
-                n_alpha, n_beta, n_orb,
-                initial_dets_dict=init_dict,
-                save_path=None
-            )
-            log_important(
-                f"✅ Generated {len(current_core_set)} determinants from initial_dets_dict "
-                f"(coeffs normalized, before norm={list(init_dict.values())})"
-            )
+            current_core_set, current_core_coeffs = generate_initial_states(
+                n_alpha, n_beta, n_orb, initial_dets_dict=init_dict, save_path=None)
+            log_important(f"✅ Generated {len(current_core_set)} determinants from initial_dets_dict")
             if debug:
-                #print current_core_set
-                #print current_coeffs
                 log_verbose(f"🔄 Initial core set: {current_core_set}")
-                log_verbose(f"🔄 Initial coeffs: {current_coeffs}")
+                log_verbose(f"🔄 Initial coeffs: {current_core_coeffs}")
         else:
-            # default reference
             det_ref = generate_reference_det(n_alpha, n_beta, n_orb)
             log_verbose(f"🔄 Reference determinant: {det_ref}")
             current_core_set = [det_ref]
-            current_coeffs = [1.0]
+            current_core_coeffs = [1.0]
 
-
-    
     pool_size = max(math.ceil(len(current_core_set) * pool_core_ratio), initial_pool_size)
-
     previous_energy = None
     current_dets = current_core_set
-    
-    # Calculate initial energy if determinants were loaded from file
-    if getattr(args, 'load_initial_dets', False) and len(current_core_set) > 1:
-        # Need to calculate energy for the loaded determinants
-        # For now, set to 0.0 and let first iteration calculate it properly
-        current_energy = 0.0
-        log_verbose(f"🔋 Initial energy will be calculated in first iteration")
-    else:
-        current_energy = 0.0
+    current_energy = 0.0
 
-    # Iteration info tracking
+    # Iteration tracking
     iteration_details = {
         'max_iterations': max_iterations,
         'energy_threshold': energy_threshold,
@@ -896,287 +1327,486 @@ def iterative_workflow(h1, eri, n_alpha, n_beta, n_orb,
         total_energy_init = current_energy + nuclear_repulsion
         iter_info_init['electronic_energy'] = current_energy
         iter_info_init['total_energy'] = total_energy_init
-        iter_info_init['final_dets_count'] = len(current_core_set)
+        iter_info_init['n_dets'] = len(current_core_set)
 
-        # Prepare final_coeffs sorted by magnitude
-        sorted_idx = np.argsort(np.abs(current_coeffs))[::-1]
-        final_coeffs_init = [current_coeffs[i] for i in sorted_idx]
+        # Sort by magnitude if more than 1 det (initial state may not be sorted)
+        if len(current_core_set) > 1:
+            sorted_idx = np.argsort(np.abs(current_core_coeffs))[::-1]
+            save_dets = [current_core_set[i] for i in sorted_idx]
+            save_coeffs = [current_core_coeffs[i] for i in sorted_idx]
+        else:
+            save_dets, save_coeffs = current_core_set, current_core_coeffs
 
-        # Save using same format as iteration results
-        save_iteration_results(-1, current_energy, total_energy_init,
-                               current_core_set, final_coeffs_init, current_coeffs,
-                               current_core_set, iter_info_init, outdir=results_dir,
-                               pool=None, save_pool=save_pool)
+        save_iteration_results(-1, save_dets, save_coeffs, iter_info_init, 
+                               outdir=results_dir, pool=None, save_pool=save_pool)
 
     n_total_configs = comb(n_orb, n_alpha) * comb(n_orb, n_beta)
     for iteration in range(max_iterations):
         iteration_start = time.perf_counter()
 
-        # Get core_set_ratio for current iteration
+        # Current iteration config
         if isinstance(_core_set_ratio, list):
             core_set_ratio = _core_set_ratio[iteration % len(_core_set_ratio)]
         else:
             core_set_ratio = _core_set_ratio
 
-
         log_important("="*60)
         log_important(f"{RED_BOLD}🔄 TrimCI iteration {iteration+1}/{max_iterations}{RESET}")
-        log_verbose(f"🔧 Core set ratio: {core_set_ratio:.4f}")
-
-
         pool_size = min(pool_size, n_total_configs)
+
+        # for research purpose
+        if getattr(args, "research_tool_dict", {}).get("minimum_pool_size", 1) > pool_size:
+            pool_size = getattr(args, "research_tool_dict", {}).get("minimum_pool_size", 1)
+            log_important(f"⚠️ Research_tool: minimum pool size {pool_size}")
+
         iter_info = {
             'iteration': iteration+1,
-            'core_set_size': len(current_core_set),
-            'pool_size': pool_size
+            'core_set_size(before_pool_building)': len(current_core_set),
+            'target_pool_size': pool_size
         }
 
-        # Step 1: Pool building
-        start_time = time.perf_counter()
+        # =====================================================================
+        # STEP 1: Pool Construction via Heat-Bath Screening
+        # =====================================================================
+        # Expand the current core set by generating connected determinants.
+        # Uses importance sampling: H_ij * c_j weighting to prioritize
+        # determinants with strong coupling to the current wavefunction.
+        pool_start_time = time.perf_counter()
 
         log_verbose(f"📦 Building pool with {len(current_core_set)} core determinants")
+        # Control C++ output: pass verbosity directly
+        _verbosity = getattr(args, 'verbosity', 1 if getattr(args, 'verbose', False) else 0)
+        pool_verbosity = _verbosity
         if pool_build_strategy == 'heat_bath':
-            norm = np.sqrt(np.sum([c**2 for c in current_coeffs]))
-            current_coeffs = [c/norm for c in current_coeffs]
-            pool, final_threshold = screening(current_core_set, current_coeffs, n_orb, h1, eri,
+            norm = np.sqrt(np.sum([c**2 for c in current_core_coeffs]))
+            current_core_coeffs = [c/norm for c in current_core_coeffs]
+            pool, final_threshold = screening(current_core_set, current_core_coeffs, n_orb, h1, eri,
                                             threshold, pool_size, {},
-                                            f"{mol_name}.bin",
-                                            max_rounds=max_rounds)
+                                            f"{system_name}.bin",
+                                            max_rounds=max_rounds,
+                                            threshold_decay=threshold_decay,
+                                            attentive_orbitals=attentive_orbitals,
+                                            verbosity=pool_verbosity,
+                                            strategy_factor=strategy_factor)
         elif pool_build_strategy == 'normalized_uniform':
             coeffs = [1.0/np.sqrt(len(current_core_set))] * len(current_core_set)
             pool, final_threshold = screening(current_core_set, coeffs, n_orb, h1, eri,
                                             threshold, pool_size, {},
-                                            f"{mol_name}.bin",
-                                            max_rounds=max_rounds)
+                                            f"{system_name}.bin",
+                                            max_rounds=max_rounds,
+                                            threshold_decay=threshold_decay,
+                                            attentive_orbitals=attentive_orbitals,
+                                            verbosity=pool_verbosity,
+                                            strategy_factor=strategy_factor)
         elif pool_build_strategy == 'uniform':
             pool, final_threshold = screening(current_core_set, [], n_orb, h1, eri,
                                             threshold, pool_size, {},
-                                            f"{mol_name}.bin",
-                                            max_rounds=max_rounds)
+                                            f"{system_name}.bin",
+                                            max_rounds=max_rounds,
+                                            threshold_decay=threshold_decay,
+                                            attentive_orbitals=attentive_orbitals,
+                                            verbosity=pool_verbosity,
+                                            strategy_factor=strategy_factor)
+        elif pool_build_strategy == 'heat_bath_pt2':
+            # PT2-weighted screening: uses |H_ij * c_i| / |E_0 - H_jj|
+            # This gives higher weight to determinants with smaller energy gaps
+            norm = np.sqrt(np.sum([c**2 for c in current_core_coeffs]))
+            current_core_coeffs = [c/norm for c in current_core_coeffs]
+            
+            # Compute precise E0 for current core_set using fast CI energy evaluation
+            # This is more accurate than using prev_energy from a different det set
+            evaluate_ci_energy = trimci_core.evaluate_ci_energy
+            dets_alpha = [d.alpha for d in current_core_set]
+            dets_beta = [d.beta for d in current_core_set]
+            current_e0 = evaluate_ci_energy(dets_alpha, dets_beta, current_core_coeffs, 
+                                           h1.tolist() if hasattr(h1, 'tolist') else h1,
+                                           eri.reshape(-1).tolist() if hasattr(eri, 'reshape') else eri,
+                                           n_orb)
+            log_verbose(f"📐 PT2 screening with E0={current_e0:.6f}")
+            
+            pool, final_threshold = screening(current_core_set, current_core_coeffs, n_orb, h1, eri,
+                                            threshold, pool_size, {},
+                                            f"{system_name}.bin",
+                                            max_rounds=max_rounds,
+                                            threshold_decay=threshold_decay,
+                                            attentive_orbitals=attentive_orbitals,
+                                            verbosity=pool_verbosity,
+                                            screening_mode="heat_bath_pt2",
+                                            e0=current_e0,
+                                            strategy_factor=strategy_factor)
+        elif pool_build_strategy == 'pt2':
+            # Full PT2 estimation (aggregates contributions from multiple parents)
+            norm = np.sqrt(np.sum([c**2 for c in current_core_coeffs]))
+            current_core_coeffs = [c/norm for c in current_core_coeffs]
+            
+            # Compute precise E0 for current core_set
+            evaluate_ci_energy = trimci_core.evaluate_ci_energy
+            dets_alpha = [d.alpha for d in current_core_set]
+            dets_beta = [d.beta for d in current_core_set]
+            current_e0 = evaluate_ci_energy(dets_alpha, dets_beta, current_core_coeffs,
+                                           h1.tolist() if hasattr(h1, 'tolist') else h1,
+                                           eri.reshape(-1).tolist() if hasattr(eri, 'reshape') else eri,
+                                           n_orb)
+            log_verbose(f"📐 PT2 screening with E0={current_e0:.6f}")
+            
+            pool, final_threshold = screening(current_core_set, current_core_coeffs, n_orb, h1, eri,
+                                            threshold, pool_size, {},
+                                            f"{system_name}.bin",
+                                            max_rounds=max_rounds,
+                                            threshold_decay=threshold_decay,
+                                            attentive_orbitals=attentive_orbitals,
+                                            verbosity=pool_verbosity,
+                                            screening_mode="pt2",
+                                            e0=current_e0,
+                                            strategy_factor=strategy_factor)
         else:
             raise ValueError(f"Unknown pool_build_strategy: {pool_build_strategy}")
 
-        log_verbose(f"🔍 Screening completed: {len(pool)} determinants "
-                 f"in {time.perf_counter()-start_time:.1f}s, final threshold: {final_threshold:.2e}")
+        # for research purpose
+        if getattr(args, "research_tool_dict", {}).get("pool_size_control", False):
+            actual_pool_size = len(pool)
+            pool = pool[:pool_size]
+            log_important(f"⚠️ Research_tool: Pool size {actual_pool_size} -> {pool_size}")
 
-        iter_info['pool_time'] = time.perf_counter() - start_time
+        log_verbose(f"🔍 Screening completed: {len(pool)} determinants "
+                 f"in {time.perf_counter()-pool_start_time:.1f}s, final threshold: {final_threshold:.2e}")
+
+        iter_info['pool_building_time'] = time.perf_counter() - pool_start_time
         iter_info['actual_pool_size'] = len(pool)
         iter_info['final_threshold'] = final_threshold
-        
-        # Update threshold for next iteration
-        # 2025-10-16 21:49:59
+
         if iteration > 0:
             threshold = final_threshold
 
-        if len(pool) < len(current_core_set) * pool_core_ratio:
-            log_important(f"⚠️ Pool size {len(pool)} < {len(current_core_set) * pool_core_ratio}, stopping.")
-            break
 
-
-        # Step 2: Smart trim
+        # =====================================================================
+        # STEP 2: Local Trim Parameter Setup
+        # =====================================================================
+        # Configure the hierarchical trimming: divide pool into `num_groups`
+        # subgroups, keep top-k from each subgroup to reduce N^3 -> N^2 scaling.
+        
+        # Dynamic num_groups: scale with core_set_size if num_groups_ratio > 0
+        if num_groups_ratio > 0:
+            num_groups = max(num_groups_base, int(len(current_core_set) * num_groups_ratio))
+        else:
+            num_groups = num_groups_base
+        
         if num_groups>=1:
             trim_m = [num_groups]
-            if keep_pool_to_next_core_ratio > 0:
-                #keep_pool_size = math.ceil(len(current_core_set)*core_set_ratio)*keep_pool_to_next_core_ratio
-                keep_pool_size = math.ceil(len(current_core_set)*keep_pool_to_next_core_ratio)
+            if local_trim_keep_ratio > 0:
+                keep_pool_size = math.ceil(len(current_core_set) * local_trim_keep_ratio)
                 trim_k = [math.ceil(keep_pool_size / num_groups)]
             else:
                 trim_k = [math.ceil(pool_size * keep_ratio / num_groups)]
         else:
             m = int(np.power(pool_size, num_groups))
             trim_m = [m]
-            if keep_pool_to_next_core_ratio > 0:
-                #keep_pool_size = math.ceil(len(current_core_set)*core_set_ratio)*keep_pool_to_next_core_ratio
-                keep_pool_size = math.ceil(len(current_core_set)*keep_pool_to_next_core_ratio)
+            if local_trim_keep_ratio > 0:
+                keep_pool_size = math.ceil(len(current_core_set) * local_trim_keep_ratio)
                 trim_k = [math.ceil(keep_pool_size / m)]
             else:
                 trim_k = [math.ceil(pool_size * keep_ratio / m)]
 
         iter_info['trim_m'], iter_info['trim_k'] = trim_m, trim_k
 
-        # Step 3: Run trim
+        # =====================================================================
+        # STEP 3: Subspace Diagonalization & Selection (TRIM Core)
+        # =====================================================================
+        # Execute the core TrimCI algorithm:
+        #   1. Partition pool into m groups
+        #   2. For each group: build H_ij, diagonalize, keep top-k by |c_i|
+        #   3. Merge survivors, re-diagonalize for final variational energy
         log_verbose(f"✂️  Running trim with m={trim_m}, k={trim_k}")
-        current_energy, current_dets, current_coeffs = trim(
-            pool=pool,
-            h1=h1,
-            eri=eri,
-            mol_name=mol_name,
-            n_elec=n_alpha+n_beta,
-            n_orb=n_orb,
-            group_sizes=trim_m,
-            keep_sizes=trim_k,
-            quantization=False,
-            save_cache=False,
-            verbose=getattr(args, 'verbose', False),
-            external_core_dets=current_core_set 
+        
+        funcs = get_functions_for_system(n_orb)
+        run_trim_func = funcs['run_trim']
+        current_energy, current_dets, trim_coeffs = run_trim_func(
+            pool, h1, eri, system_name, n_alpha+n_beta, n_orb,
+            trim_m, trim_k, 
+            False, False, current_core_set, 1e-3, pool_verbosity
         )
 
-        iter_info['final_dets_count'] = len(current_dets)
-        iter_info['electronic_energy'] = current_energy
+        iter_info['raw_dets_count'] = len(current_dets)
+        iter_info['raw_electronic_energy'] = current_energy
+        
+        # TRIM returns dets and coeffs that are consistent
+        # full_coeffs: saved before truncation for output (return_mode='full')
+        # current_core_coeffs: will be truncated for next iteration
+        full_coeffs = list(trim_coeffs)
+        current_core_coeffs = list(trim_coeffs)
 
-        # Step 4: Energy accounting
+        # =====================================================================
+        # STEP 4: Energy Accounting & Statistics
+        # =====================================================================
+        # Compute total energy (E_elec + E_nuc), track ΔE.
+        # Note: Convergence decision is made in STEP 6.
         total_energy = current_energy + nuclear_repulsion
-        iter_info['total_energy'] = total_energy
+        iter_info['raw_energy'] = total_energy
         log_important(f"⚡ Iteration {iteration+1} total energy: {total_energy:.8f}")
-        log_important(f"🔤 Core set: {len(current_core_set)}, Determinants: {len(current_dets)}")
+        log_important(f"🔤 Core set: {len(current_core_set)}, Raw Determinants: {len(current_dets)}")
 
-        # Step 5: Convergence
+        # Compute energy change for convergence tracking
         if previous_energy is not None:
-            energy_change = abs(total_energy - previous_energy)
+            energy_change = total_energy - previous_energy
             iter_info['energy_change'] = energy_change
-            log_important(f"📊 ΔE = {-energy_change:.2e}")
-            
-
-            if energy_change < energy_threshold:
-                log_important("✅ Converged")
-                iter_info['converged'] = True
-            else:
-                iter_info['converged'] = False
+            log_important(f"📊 ΔE = {energy_change:.2e}")
+            # Convergence: |ΔE| < threshold (energy can go up or down)
+            iter_info['converged'] = (abs(energy_change) < energy_threshold)
         else:
             iter_info['converged'] = False
         previous_energy = total_energy
 
-        # Record and output iteration timing details
-        time_cost = time.perf_counter() - iteration_start
-        iter_info['iteration_time'] = time_cost
+        # =====================================================================
+        # STEP 5: Core Set Growth & Preparation for Next Iteration
+        # =====================================================================
+        # Sort determinants by |coefficient|, grow core set by schedule or ratio,
+        # normalize coefficients, and compute next iteration's pool size.
+        old_size = len(current_core_set)
         
-        # Calculate cumulative time
-        total_elapsed = time.perf_counter() - start_total
-        iter_info['cumulative_time'] = total_elapsed
-        
-        # Output detailed timing information
-        # Auto-pick best unit for time display
-        if total_elapsed < 60:
-            unit, factor = "s", 1
-        elif total_elapsed < 3600:
-            unit, factor = "min", 60
+        # DMRG-style noise injection: add randomness to help escape local minima
+        # Noise is added to |coefficients| before sorting, giving smaller dets a chance
+        if noise_strength > 0:
+            abs_coeffs = np.abs(full_coeffs)
+            # Scale noise by max coefficient (DMRG convention: ~1e-3 of max singular value)
+            noise_scale = noise_strength * np.max(abs_coeffs)
+            abs_coeffs = abs_coeffs + np.random.randn(len(abs_coeffs)) * noise_scale
+            sorted_idx = np.argsort(abs_coeffs)[::-1]
+            log_verbose(f"🎲 Noise injection: strength={noise_strength:.3f}, scale={noise_scale:.2e}")
         else:
-            unit, factor = "h", 3600
-        log_important(f"⏱️  Iteration {iteration+1} time: {time_cost:.2f}s (Total: {total_elapsed/factor:.1f}{unit})")
-        if 'pool_time' in iter_info:
-            trim_time = time_cost - iter_info['pool_time']
-            iter_info['trim_time'] = trim_time
-            log_important(f"📊 Pool: {iter_info['pool_time']:.2f}s, Trim: {trim_time:.2f}s")
-
-        # Save iteration results
-        iteration_details['iterations'].append(iter_info)
-
-
-
-
-        # Step 6: Update core set
-        old_size = len(current_core_set)  # Define old_size before the if condition
-        # Always create final_coeffs for potential use in save_iteration_results
-        sorted_idx = np.argsort(np.abs(current_coeffs))[::-1]
-        final_coeffs = [current_coeffs[i] for i in sorted_idx]
+            sorted_idx = np.argsort(np.abs(full_coeffs))[::-1]
+        sorted_dets = [current_dets[i] for i in sorted_idx]
+        sorted_coeffs = [full_coeffs[i] for i in sorted_idx]
         
-        if iteration < max_iterations - 1:
-            new_size = min(len(current_dets), math.ceil(old_size*core_set_ratio))
-            log_important(f"🔄 Updating core set size: {old_size} -> {new_size} (max: {len(current_dets)})")
+        # Compute new core size
+        # Priority: core_set_schedule > first_cycle_keep_size > core_set_ratio
+        if core_set_schedule is not None and iteration < len(core_set_schedule):
+            # Use scheduled size for this iteration
+            scheduled_size = core_set_schedule[iteration]
+            new_size = min(len(current_dets), scheduled_size)
+            log_important(f"📋 Core set (scheduled): {old_size} -> {new_size} "
+                         f"(schedule[{iteration}]={scheduled_size}, max: {len(current_dets)})")
+        elif iteration == 0 and getattr(args, 'first_cycle_keep_size', 0):
+            new_size = min(len(current_dets), getattr(args, 'first_cycle_keep_size', 0))
+            log_important(f"🔄 Core set: {old_size} -> {new_size} (max: {len(current_dets)})")
+        else:
+            new_size = min(len(current_dets), math.ceil(old_size * core_set_ratio))
             if core_set_ratio <= 0:
                 new_size = 1
-                log_important(f"⚠️ Core set ratio {core_set_ratio:.4f} <= 0, setting new_size to 1.")
+            log_important(f"🔄 Core set: {old_size} -> {new_size} (max: {len(current_dets)})")
 
-            if iteration == 0 and getattr(args, 'first_cycle_keep_size', 0):
-                new_size = min(len(current_dets), getattr(args, 'first_cycle_keep_size', 0))
-                log_important(f"🔄 First cycle, setting new_size to {new_size} (max: {getattr(args, 'first_cycle_keep_size', 0)})")
+        # Truncate and normalize
+        current_core_set = [current_dets[i] for i in sorted_idx[:new_size]]
+        current_core_coeffs = [sorted_coeffs[i] for i in range(new_size)]
+        norm = np.linalg.norm(current_core_coeffs)
+        current_core_coeffs = [c/norm for c in current_core_coeffs]
+        iter_info['core_set_size(after_trimming)'] = new_size
+
+        pool_size = math.ceil(new_size * pool_core_ratio)
+        iter_info['next_pool_size'] = pool_size
+        log_verbose(f"📈 Next pool size: {pool_size}")
+
+        # Periodic save (core_set is already sorted by |coeff|)
+        if (iteration + 1) % save_period == 0 or (save_initial and iteration == 0):
+            save_iteration_results(iteration + 1,
+                        current_core_set, current_core_coeffs, iter_info, 
+                        outdir=results_dir, pool=pool, save_pool=save_pool)
+
+        # =====================================================================
+        # STEP 6: Termination Conditions
+        # =====================================================================
+        # Finalize iteration timing and bookkeeping, then check stopping criteria.
+        
+        # Timing (includes all steps 1-5)
+        time_cost = time.perf_counter() - iteration_start
+        total_elapsed = time.perf_counter() - start_time
+        
+        # Auto-pick best unit for time display
+        unit, factor = ("s", 1) if total_elapsed < 60 else (("min", 60) if total_elapsed < 3600 else ("h", 3600))
+        log_important(f"⏱️  Iteration {iteration+1} time: {time_cost:.2f}s (Total: {total_elapsed/factor:.1f}{unit})")
+        if 'pool_time' in iter_info:
+            iter_info['trim_time'] = time_cost - iter_info['pool_time']
+            log_important(f"📊 Pool: {iter_info['pool_time']:.2f}s, Trim: {iter_info['trim_time']:.2f}s")
+
+        iter_info['iteration_time'] = time_cost
+        iter_info['cumulative_time'] = total_elapsed
 
 
-
-
-            current_core_set = [current_dets[i] for i in sorted_idx[:new_size]]
-            current_coeffs = [current_coeffs[i] for i in sorted_idx[:new_size]]
-            # Renormalize coefficients
-            norm = np.sqrt(np.sum([c**2 for c in current_coeffs]))
-            current_coeffs = [c/norm for c in current_coeffs]
-            iter_info['next_core_set_size'] = new_size
-
-            if new_size == old_size and not getattr(args, 'allow_core_set_unchange', True):
-                log_important("🛑 Core set unchanged, stopping.")
-                break
-
-            pool_size = math.ceil(new_size * pool_core_ratio)
-            iter_info['next_pool_size'] = pool_size
-            log_verbose(f"📈 Next pool size: {pool_size}")
-
-            if (iteration + 1) % save_period == 0 or (save_initial and iteration == 0):
-                save_iteration_results(iteration + 1, current_energy, total_energy,
-                            current_dets, final_coeffs, current_coeffs,
-                            current_core_set, iter_info, outdir=results_dir,
-                            pool=pool, save_pool=save_pool)
-
-
-
-        # Step 7: Max determinants stopping condition
-        if (max_final_dets is not None and len(current_dets) >= max_final_dets and
-                iteration > 0):
-            log_important(f"🛑 Exceeded max_final_dets={max_final_dets}, stopping.")
-            iter_info['stopped_by_max_final_dets_actual'] = True
+        # Commit iteration record
+        iteration_details['iterations'].append(iter_info)
+        
+        # Check stopping criteria (in priority order):
+        #   1. Energy convergence
+        #   2. core_set_schedule exhausted
+        #   3. max_iterations reached
+        #   4. max_final_dets reached (only if NOT using schedule)
+        
+        # Termination by energy convergence (DISABLED - can cause premature stopping)
+        # if iter_info.get('converged', False):
+        #     log_important(f"✅ Energy converged (ΔE < {energy_threshold:.2e}), stopping.")
+        #     iter_info['stopped_by_convergence'] = True
+        #     break
+        
+        # Termination by schedule exhaustion
+        if core_set_schedule is not None and iteration >= len(core_set_schedule) - 1:
+            log_important(f"📋 Core set schedule exhausted at iteration {iteration+1}, stopping.")
+            iter_info['stopped_by_schedule'] = True
+            break
+        
+        # Termination by max_iterations
+        if iteration >= max_iterations - 1:
+            log_important(f"🛑 Reached max_iterations={max_iterations}, stopping.")
+            iter_info['stopped_by_max_iterations'] = True
+            break
+        
+        # Termination by max_final_dets (skip if using schedule - let schedule control)
+        if core_set_schedule is None and max_final_dets is not None and len(current_core_set) >= max_final_dets:
+            log_important(f"🛑 Reached max_final_dets={max_final_dets}, stopping.")
+            iter_info['stopped_by_max_final_dets'] = True
             break
 
-        if iter_info.get('converged', False):
-            break
+    # =========================================================================
+    # FINALIZATION: Post-Processing & Result Assembly
+    # =========================================================================
+    # After the iterative loop completes:
+    #   1. Store "raw" results from the last TRIM iteration (before truncation)
+    #   2. Run final Davidson diagonalization on the truncated core set
+    #      (with warm-start from previous coefficients to avoid excited states)
+    #   3. Assemble iteration_details and save to disk
+    
+    # Record the "raw" results from the last trim iteration
+    final_raw_energy = current_energy + nuclear_repulsion
+    final_raw_dets = current_dets
+    final_raw_coeffs = full_coeffs
+    final_raw_dets_count = len(current_dets)
+    
+    # Compute final core energy by running Davidson on the core_set
+    # This gives us a cleaner energy estimate using only the most important determinants
+    funcs = get_functions_for_system(n_orb)
+    diag_func = funcs['diagonalize_subspace_davidson']
 
-    final_energy = current_energy + nuclear_repulsion
-    total_time = time.perf_counter() - start_total
-    log_important(f"⏱️ Final energy: {final_energy:.8f}")
-    log_important(f"⏱️ Workflow time: {total_time:.1f}s")
+    # Use the core_set (already sorted and truncated) for final diagonalization
+    # Pass current_core_coeffs as initial guess for warm start (avoids excited state locking)
+    core_energy, core_coeffs_out = diag_func(
+        current_core_set,      # core determinants
+        h1,                    # 1-electron integrals
+        eri,                   # 2-electron integrals (already flat)
+        {},                    # Hij cache
+        False,                 # quantization
+        500,                   # max_iter
+        1e-6,                  # tolerance
+        False,                 # verbose
+        n_orb,                 # n_orb
+        current_core_coeffs    # initial guess from previous iteration (warm start)
+    )
+    final_core_energy = core_energy + nuclear_repulsion
+    final_core_coeffs = list(core_coeffs_out)
+    final_core_dets_count = len(current_core_set)
+
+    
+    # Use core energy as the final energy (cleaner, on the truncated variational space)
+    final_energy = final_core_energy
+    
+    total_time = time.perf_counter() - start_time
+    log_important(f"⏱️ Final energy: {final_energy:.8f}, Workflow time: {total_time:.1f}s")
 
     iteration_details.update({
         'total_time': total_time,
+        # Final core set results (primary output)
         'final_energy': final_energy,
-        'final_electronic_energy': current_energy,
-        'final_dets_count': len(current_dets),
+        'final_core_energy': final_core_energy,
+        'final_core_dets_count': final_core_dets_count,
+        # Raw results from last trim (for reference)
+        'final_raw_energy': final_raw_energy,
+        'final_raw_dets_count': final_raw_dets_count,
+        # Legacy fields (deprecated but kept for compatibility)
+        'final_electronic_energy': final_core_energy - nuclear_repulsion,
+        'final_dets_count': final_core_dets_count,
+        # Metadata
         'converged': any(it.get('converged', False) for it in iteration_details['iterations']),
         'total_iterations': len(iteration_details['iterations']),
+        'n_electrons': n_alpha + n_beta,
+        'n_orbitals': n_orb,
+        'nuclear_repulsion': nuclear_repulsion,
         'results_dir': results_dir
     })
 
-    iteration_details['n_electrons'] = n_alpha + n_beta
-    iteration_details['n_orbitals'] = n_orb
-    iteration_details['nuclear_repulsion'] = nuclear_repulsion
-    iteration_details['results_dir'] = results_dir
+    # Output: core_set with fresh coefficients from Davidson
+    save_final_results(final_energy, current_core_set, final_core_coeffs, 
+                       iteration_details, args, outdir=results_dir)
 
-    # Ensure final_coeffs is defined (in case no iterations were executed)
-    if 'final_coeffs' not in locals():
-        sorted_idx = np.argsort(np.abs(current_coeffs))[::-1]
-        final_coeffs = [current_coeffs[i] for i in sorted_idx]
-
-    save_final_results(final_energy, current_dets, final_coeffs, current_coeffs,
-                       current_core_set, iteration_details, args, outdir=results_dir)
-
-    return final_energy, current_dets, current_coeffs, iteration_details, args
+    return final_energy, current_core_set, final_core_coeffs, iteration_details, args
 
 # ========== Configuration ==========
+DEFAULT_CONFIG = {
+    "threshold": 0.06,
+    "local_trim_keep_ratio": 0.1,
+    "verbose": False,
+    "initial_pool_size": 100,
+    "core_set_ratio": 1.02,
+    "pool_core_ratio": 20,
+    "max_final_dets": 100,
+    "max_rounds": 2,
+    "pool_build_strategy": "heat_bath",
+    "num_groups": 10,
+    "load_initial_dets": False,
+    "num_runs": 1,
+    "first_cycle_keep_size": 10,  # Default keep size for first cycle
+}
+
+def _load_config_from_py(py_path: str) -> dict:
+    """Load config dict from a Python file."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("trimci_config", py_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if hasattr(module, 'config') and isinstance(module.config, dict):
+        return module.config
+    raise ValueError(f"trimci_config.py must define a 'config' dict, not found in {py_path}")
+
+def _load_config_from_json(json_path: str) -> dict:
+    """Load config dict from a JSON file."""
+    with open(json_path, 'r') as f:
+        return json.load(f)
+
 def load_configurations(config_dir: str, trimci_config_path: str = None, save_if_not_exist: bool = True):
-    default_config = {
-            "threshold": 0.06,
-            "local_trim_keep_ratio": 0.1,
-            "verbose": False,
-            "initial_pool_size": 100,
-            "core_set_ratio": 1.02,
-            "pool_core_ratio": 20,
-            "max_final_dets": 100,
-            "max_rounds": 2,
-            "pool_build_strategy": "heat_bath",
-            "num_groups": 10,
-            "load_initial_dets": False,
-            "num_runs": 1,
-        }
+    """
+    Load TrimCI configuration with priority:
+      1. Explicit path (if provided): .py or .json based on extension
+      2. Auto-detect in config_dir: trimci_config.py > trimci_config.json
+      3. Default config (optionally saved as .json)
+    """
+    config = DEFAULT_CONFIG.copy()
 
-    if trimci_config_path is None:
-        trimci_config_path = os.path.join(config_dir, "trimci_config.json")
-    if os.path.exists(trimci_config_path):
-        with open(trimci_config_path, 'r') as f:
-            default_config.update(json.load(f))
-        log_verbose(f"📋 Loaded config: {trimci_config_path}")
+    # Case 1: Explicit path provided
+    if trimci_config_path is not None:
+        if os.path.exists(trimci_config_path):
+            if trimci_config_path.endswith('.py'):
+                config.update(_load_config_from_py(trimci_config_path))
+            else:
+                config.update(_load_config_from_json(trimci_config_path))
+            log_verbose(f"📋 Loaded config: {trimci_config_path}")
+        else:
+            log_verbose(f"⚠️ Config file not found: {trimci_config_path}, using defaults")
+        return Namespace(**config)
+
+    # Case 2: Auto-detect in config_dir (priority: .py > .json)
+    py_path = os.path.join(config_dir, "trimci_config.py")
+    json_path = os.path.join(config_dir, "trimci_config.json")
+
+    if os.path.exists(py_path):
+        config.update(_load_config_from_py(py_path))
+        log_verbose(f"📋 Loaded config: {py_path}")
+    elif os.path.exists(json_path):
+        config.update(_load_config_from_json(json_path))
+        log_verbose(f"📋 Loaded config: {json_path}")
     else:
+        # Case 3: No config found, optionally create default .json
         if save_if_not_exist:
-            with open(trimci_config_path, 'w') as f:
-                json.dump(default_config, f, indent=2)
-            log_verbose(f"📋 Created default config: {trimci_config_path}")
+            with open(json_path, 'w') as f:
+                json.dump(DEFAULT_CONFIG, f, indent=2)
+            log_verbose(f"📋 Created default config: {json_path}")
 
-    return Namespace(**default_config)
+    return Namespace(**config)
 
 def dets_to_array(dets):
     """Convert determinants to numpy array as uint64 pairs for C++ compatibility"""
@@ -1403,73 +2033,61 @@ def load_initial_dets_from_file(dets_path: str = "dets.npz", core_set: bool = Fa
         log_verbose(f"❌ Error loading {dets_path}: {e}")
         return None, None
 
-def save_iteration_results(iter_idx, current_energy, total_energy,
-                           current_dets, final_coeffs, current_coeffs,
-                           current_core_set, iter_info,
+def save_iteration_results(iter_idx, dets, coeffs, iter_info,
                            outdir="results", pool=None, save_pool=False):
+    """Save intermediate iteration results."""
     Path(outdir).mkdir(exist_ok=True)
 
-    # Get top-10 determinants
-    top_10_dets = get_top_determinants(current_dets, final_coeffs, top_n=10)
+    top_10_dets = get_top_determinants(dets, coeffs, top_n=10)
 
-    # Save energy and statistical information
+    # Save JSON
     json_path = os.path.join(outdir, f"iter_{iter_idx:03d}.json")
     with open(json_path, "w") as f:
         json.dump({
             "iteration": iter_idx,
-            "electronic_energy": current_energy,
-            "total_energy": total_energy,
-            "final_dets_count": len(current_dets),
-            "core_set_size": len(current_core_set),
+            "n_dets": len(dets),
             "iteration_info": iter_info,
             "top_10_determinants": top_10_dets
         }, f, indent=2)
 
-    # Save determinants and coefficients
+    # Save NPZ (with dual naming for backward compatibility)
     npz_path = os.path.join(outdir, f"iter_{iter_idx:03d}.npz")
+    dets_arr = dets_to_array(dets)
+    coeffs_arr = np.array(coeffs)
+    save_data = {
+        'dets': dets_arr, 'core_set': dets_arr,  # dual naming
+        'coeffs': coeffs_arr, 'core_set_coeffs': coeffs_arr, 'dets_coeffs': coeffs_arr  # triple naming
+    }
     if save_pool and pool is not None:
-        np.savez_compressed(npz_path,
-                            dets=dets_to_array(current_dets),
-                            dets_coeffs=np.array(final_coeffs),
-                            core_set_coeffs=np.array(current_coeffs),
-                            core_set=dets_to_array(current_core_set),
-                            pool=dets_to_array(pool))
-    else:
-        np.savez_compressed(npz_path,
-                            dets=dets_to_array(current_dets),
-                            dets_coeffs=np.array(final_coeffs),
-                            core_set_coeffs=np.array(current_coeffs),
-                            core_set=dets_to_array(current_core_set))
-    log_verbose(f"💾 Saved iteration {iter_idx} results → {json_path}, {npz_path}")
+        save_data['pool'] = dets_to_array(pool)
+    np.savez_compressed(npz_path, **save_data)
+    log_verbose(f"💾 Saved iteration {iter_idx} → {npz_path}")
 
-def save_final_results(final_energy, current_dets, final_coeffs, current_coeffs,
-                       current_core_set, iteration_details, args,
-                       outdir="results"):
+def save_final_results(final_energy, dets, coeffs, iteration_details, args, outdir="results"):
+    """Save final TrimCI results."""
     Path(outdir).mkdir(exist_ok=True)
 
-    # Get top-10 determinants
-    top_10_dets = get_top_determinants(current_dets, final_coeffs, top_n=10)
+    top_10_dets = get_top_determinants(dets, coeffs, top_n=10)
 
-    # Save final summary
+    # Save JSON
     json_path = os.path.join(outdir, "trimci_results.json")
     with open(json_path, "w") as f:
         json.dump({
             "final_energy": final_energy,
-            "final_dets_count": len(current_dets),
-            "final_core_set_size": len(current_core_set),
+            "n_dets": len(dets),
             "config": vars(args),
             "iteration_summary": iteration_details,
             "top_10_determinants": top_10_dets
         }, f, indent=2)
 
-    # Save final determinants
+    # Save NPZ (with dual naming for backward compatibility)
     npz_path = os.path.join(outdir, "dets.npz")
+    dets_arr = dets_to_array(dets)
+    coeffs_arr = np.array(coeffs)
     np.savez_compressed(npz_path,
-                        dets=dets_to_array(current_dets),
-                        dets_coeffs=np.array(final_coeffs),
-                        core_set_coeffs=np.array(current_coeffs),
-                        core_set=dets_to_array(current_core_set))
-    log_important(f"💾 Saved final results → {json_path}, {npz_path}")
+                        dets=dets_arr, core_set=dets_arr,  # dual naming
+                        coeffs=coeffs_arr, core_set_coeffs=coeffs_arr, dets_coeffs=coeffs_arr)  # triple naming
+    log_important(f"💾 Saved final results → {npz_path}")
     
 
 
@@ -1549,27 +2167,44 @@ def generate_initial_states(n_alpha, n_beta, n_orb,
 
     # --- Robust create_determinant ---
     def create_determinant(alpha_bits, beta_bits):
-        """Support both int and array input"""
+        """Support both int and array input for all Determinant types"""
         class_name = str(DeterminantClass)
-        if 'Determinant192' in class_name:
-            if isinstance(alpha_bits, (list, tuple)):
-                alpha_array = [to_uint64(x) for x in alpha_bits]
-                beta_array  = [to_uint64(x) for x in beta_bits]
-            else:
-                alpha_array = [to_uint64((alpha_bits >> (64*i)) & 0xFFFFFFFFFFFFFFFF) for i in range(3)]
-                beta_array  = [to_uint64((beta_bits  >> (64*i)) & 0xFFFFFFFFFFFFFFFF) for i in range(3)]
-            return DeterminantClass(alpha_array, beta_array)
-
+        
+        # Determine number of segments based on Determinant type
+        if 'Determinant512' in class_name:
+            n_segments = 8
+        elif 'Determinant448' in class_name:
+            n_segments = 7
+        elif 'Determinant384' in class_name:
+            n_segments = 6
+        elif 'Determinant320' in class_name:
+            n_segments = 5
+        elif 'Determinant256' in class_name:
+            n_segments = 4
+        elif 'Determinant192' in class_name:
+            n_segments = 3
         elif 'Determinant128' in class_name:
+            n_segments = 2
+        else:
+            n_segments = 1
+        
+        if n_segments > 1:
+            # Multi-segment determinants require array input
             if isinstance(alpha_bits, (list, tuple)):
                 alpha_array = [to_uint64(x) for x in alpha_bits]
                 beta_array  = [to_uint64(x) for x in beta_bits]
+                # Pad if needed
+                while len(alpha_array) < n_segments:
+                    alpha_array.append(0)
+                while len(beta_array) < n_segments:
+                    beta_array.append(0)
             else:
-                alpha_array = [to_uint64((alpha_bits >> (64*i)) & 0xFFFFFFFFFFFFFFFF) for i in range(2)]
-                beta_array  = [to_uint64((beta_bits  >> (64*i)) & 0xFFFFFFFFFFFFFFFF) for i in range(2)]
+                # Convert large integer to array of uint64
+                alpha_array = [to_uint64((alpha_bits >> (64*i)) & 0xFFFFFFFFFFFFFFFF) for i in range(n_segments)]
+                beta_array  = [to_uint64((beta_bits  >> (64*i)) & 0xFFFFFFFFFFFFFFFF) for i in range(n_segments)]
             return DeterminantClass(alpha_array, beta_array)
-
         else:
+            # Standard 64-bit Determinant
             if isinstance(alpha_bits, (list, tuple)):
                 alpha_bits = alpha_bits[0]
                 beta_bits  = beta_bits[0]
@@ -1602,7 +2237,17 @@ def generate_initial_states(n_alpha, n_beta, n_orb,
             occ_beta  = rng.choice(n_orb, n_beta, replace=False)
 
             class_name = str(DeterminantClass)
-            if 'Determinant192' in class_name:
+            if 'Determinant512' in class_name:
+                n_segments = 8
+            elif 'Determinant448' in class_name:
+                n_segments = 7
+            elif 'Determinant384' in class_name:
+                n_segments = 6
+            elif 'Determinant320' in class_name:
+                n_segments = 5
+            elif 'Determinant256' in class_name:
+                n_segments = 4
+            elif 'Determinant192' in class_name:
                 n_segments = 3
             elif 'Determinant128' in class_name:
                 n_segments = 2
@@ -1618,6 +2263,45 @@ def generate_initial_states(n_alpha, n_beta, n_orb,
             for i in occ_beta.tolist():
                 seg, bit = divmod(i, 64)
                 beta_array[seg]  |= (1 << bit)
+
+            det = create_determinant(alpha_array, beta_array)
+            dets.append(det)
+            coeffs.append(float(coeff))
+
+    # --- Random closed shell determinants ---
+    def add_random_closed_shell(coeff, count=1):
+        if n_alpha != n_beta:
+            raise ValueError(f"random_closed_shell requires n_alpha ({n_alpha}) == n_beta ({n_beta})")
+
+        for _ in range(count):
+            occ = rng.choice(n_orb, n_alpha, replace=False)
+            
+            class_name = str(DeterminantClass)
+            if 'Determinant512' in class_name:
+                n_segments = 8
+            elif 'Determinant448' in class_name:
+                n_segments = 7
+            elif 'Determinant384' in class_name:
+                n_segments = 6
+            elif 'Determinant320' in class_name:
+                n_segments = 5
+            elif 'Determinant256' in class_name:
+                n_segments = 4
+            elif 'Determinant192' in class_name:
+                n_segments = 3
+            elif 'Determinant128' in class_name:
+                n_segments = 2
+            else:
+                n_segments = 1
+
+            alpha_array = [0] * n_segments
+            
+            for i in occ.tolist():
+                seg, bit = divmod(i, 64)
+                alpha_array[seg] |= (1 << bit)
+            
+            # For closed shell, beta is same as alpha
+            beta_array = list(alpha_array)
 
             det = create_determinant(alpha_array, beta_array)
             dets.append(det)
@@ -1698,7 +2382,23 @@ def generate_initial_states(n_alpha, n_beta, n_orb,
             beta_occ  = [int(x) for x in beta_str.strip().split() if x.strip().isdigit()]
 
             # build bitmasks (supports >64 orbitals)
-            n_segments = 3 if '192' in str(DeterminantClass) else (2 if '128' in str(DeterminantClass) else 1)
+            class_name = str(DeterminantClass)
+            if '512' in class_name:
+                n_segments = 8
+            elif '448' in class_name:
+                n_segments = 7
+            elif '384' in class_name:
+                n_segments = 6
+            elif '320' in class_name:
+                n_segments = 5
+            elif '256' in class_name:
+                n_segments = 4
+            elif '192' in class_name:
+                n_segments = 3
+            elif '128' in class_name:
+                n_segments = 2
+            else:
+                n_segments = 1
             alpha_array = [0] * n_segments
             beta_array  = [0] * n_segments
             for i in alpha_occ:
@@ -1724,12 +2424,17 @@ def generate_initial_states(n_alpha, n_beta, n_orb,
             elif isinstance(val, (int, float)):
                 if kind == "random":
                     add_random(val, 1)
+                elif kind == "random_closed_shell":
+                    add_random_closed_shell(val, 1)
                 else:
                     add_preset(kind, val, 1)
             elif isinstance(val, (list, tuple)):
                 if kind == "random":
                     coeff, count = val
                     add_random(coeff, int(count))
+                elif kind == "random_closed_shell":
+                    coeff, count = val
+                    add_random_closed_shell(coeff, int(count))
                 else:
                     coeff, count = val
                     add_preset(kind, coeff, int(count))
@@ -1759,145 +2464,292 @@ def generate_initial_states(n_alpha, n_beta, n_orb,
 
 
 # ========== Multi-Run Report Generation ==========
-def generate_multi_run_report(all_results, best_result, mol_name, args, final_run: bool = False):
-    """
-    Generate a comprehensive report for multiple runs in Markdown format.
-    final_run: when True, highlight the final calculation and separate exploration.
-    """
-    from datetime import datetime
-    
-    report_filename = f"multi_run_report_{mol_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
-    
-    try:
-        with open(report_filename, 'w', encoding='utf-8') as f:
-            # Header
-            title = "# TrimCI Final Run Report" if final_run else "# TrimCI Multi-Run Report"
-            f.write(title + "\n\n")
-            f.write(f"**Molecule:** {mol_name}  \n")
-            f.write(f"**Report Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  \n")
-            f.write(f"**Total Runs:** {len(all_results)}  \n\n")
-            
-            # Configuration Summary
-            f.write("## Configuration Summary\n\n")
-            f.write(f"- **Number of Runs:** {getattr(args, 'num_runs', 1)}\n")
-            f.write(f"- **Max Iterations:** {getattr(args, 'exp_max_iterations', 'N/A')}\n")
-            f.write(f"- **Energy Threshold:** {getattr(args, 'exp_energy_threshold', 'N/A')}\n")
-            f.write(f"- **Initial Pool Size:** {getattr(args, 'initial_pool_size', 'N/A')}\n")
-            f.write(f"- **Max Final Determinants:** {getattr(args, 'max_final_dets', 'N/A')}\n\n")
-            
-            # Results Summary
-            f.write("## Results Summary\n\n")
-            
-            # Best/Final result highlight
-            f.write("### 🏆 Final Result\n" if final_run else "### 🏆 Best Result\n")
-            f.write(f"- **Run:** {best_result['run_idx']}\n")
-            f.write(f"- **Final Energy:** {best_result['final_energy']:.8f} Hartree\n")
-            f.write(f"- **Number of Determinants:** {len(best_result['current_dets'])}\n")
-            best_time = best_result['iteration_details'].get('total_time', 'N/A')
-            if isinstance(best_time, (int, float)):
-                f.write(f"- **Calculation Time:** {best_time:.1f} seconds\n")
-            else:
-                f.write(f"- **Calculation Time:** {best_time}\n")
-            f.write(f"- **Results Directory:** `{best_result['results_dir']}`\n\n")
-            
-            # All runs table
-            f.write("### All Runs Comparison\n\n")
-            f.write("| Run | Final Energy (Hartree) | Determinants | Time (s) | Status |\n")
-            f.write("|-----|------------------------|--------------|----------|--------|\n")
-            
-            energies = [result['final_energy'] for result in all_results]
-            times = []
-            min_energy = min(energies)
-            max_energy = max(energies)
-            
-            for result in all_results:
-                energy = result['final_energy']
-                n_dets = len(result['current_dets'])
-                calc_time = result['iteration_details'].get('total_time', 'N/A')
-                times.append(calc_time if isinstance(calc_time, (int, float)) else None)
-                
-                if isinstance(calc_time, (int, float)):
-                    time_str = f"{calc_time:.1f}"
-                else:
-                    time_str = str(calc_time)
-                
-                if final_run:
-                    status = "🚀 Final" if str(result.get('label','')) == 'final_ndets' else "Explored"
-                else:
-                    status = "🏆 Best" if result['run_idx'] == best_result['run_idx'] else "Completed"
-                f.write(f"| {result['run_idx']} | {energy:.8f} | {n_dets} | {time_str} | {status} |\n")
-            
-            f.write("\n")
-            
-            # Add legend when final_run
-            if final_run:
-                f.write("Status legend: 🚀 Final = final_ndets, Explored = exploration variants.\n\n")
-                
-                # Run phases section
-                f.write("## Run Phases\n\n")
-                
-                # Exploration Phase summary
-                explore_runs = [r for r in all_results if str(r.get('label','')) != 'final_ndets']
-                f.write("### Exploration Phase\n\n")
-                f.write(f"- **Exploration Runs:** {len(explore_runs)}\n")
-                f.write(f"- **Goal:** {getattr(args, 'goal', 'balanced')}\n")
-                if explore_runs:
-                    try:
-                        min_exp_energy = min([rr['final_energy'] for rr in explore_runs])
-                        f.write(f"- **Best Exploration Energy:** {min_exp_energy:.8f} Hartree\n")
-                    except Exception:
-                        pass
-                f.write("\n")
-                
-                # Final Calculation summary
-                f.write("### Final Calculation\n\n")
-                f.write(f"- **Final Run Index:** {best_result['run_idx']}\n")
-                f.write(f"- **Final Energy:** {best_result['final_energy']:.8f} Hartree\n")
-                try:
-                    final_args = best_result.get('run_args', None)
-                    if final_args is not None:
-                        f.write(f"- **Target Determinants:** {getattr(final_args, 'max_final_dets', 'N/A')}\n")
-                except Exception:
-                    pass
-                f.write("\n")
-            
-            # Statistics
-            f.write("### Statistical Analysis\n\n")
-            energy_std = np.std(energies)
-            energy_range = max_energy - min_energy
-            f.write(f"- **Energy Range:** {energy_range:.8f} Hartree\n")
-            f.write(f"- **Energy Standard Deviation:** {energy_std:.8f} Hartree\n")
-            f.write(f"- **Average Energy:** {np.mean(energies):.8f} Hartree\n")
-            f.write(f"- **Median Energy:** {np.median(energies):.8f} Hartree\n\n")
-            
-            # Time statistics
-            valid_times = [t for t in times if t is not None]
-            if valid_times:
-                total_computation_time = sum(valid_times)
-                f.write("#### Timing Statistics\n\n")
-                f.write(f"- **Total Computation Time:** {total_computation_time:.1f} seconds\n")
-                f.write(f"- **Average Time per Run:** {np.mean(valid_times):.1f} seconds\n")
-                f.write(f"- **Median Time per Run:** {np.median(valid_times):.1f} seconds\n")
-                f.write(f"- **Time Range:** {min(valid_times):.1f} - {max(valid_times):.1f} seconds\n")
-                if len(valid_times) > 1:
-                    f.write(f"- **Time Standard Deviation:** {np.std(valid_times):.1f} seconds\n")
-                f.write("\n")
-            
-            # Convergence information for best run
-            if 'iterations' in best_result['iteration_details']:
-                f.write("### Best Run Convergence Details\n\n")
-                iterations = best_result['iteration_details']['iterations']
-                if iterations:
-                    f.write(f"- **Total Iterations:** {len(iterations)}\n")
-                    f.write(f"- **Final Iteration Energy:** {iterations[-1].get('energy', 'N/A')}\n")
-                    f.write(f"- **Final Core Set Size:** {iterations[-1].get('core_set_size', 'N/A')}\n\n")
-            
-            # Footer
-            f.write("---\n")
-            f.write("*Report generated by TrimCI Multi-Run Analysis*\n")
-        
-        log_important(f"📄 Multi-run report saved as: {report_filename}")
-        
-    except Exception as e:
-        log_verbose(f"⚠️ Failed to generate multi-run report: {e}")
+# Moved to report_generator.py for cleaner organization
+from .report_generator import generate_multi_run_report
 
+
+# ========== C++ Backend Iterative Workflow ==========
+def iterative_workflow(h1, eri, n_alpha, n_beta, n_orb,
+                       system_name, args, nuclear_repulsion,
+                       start_time=None, results_dir="trimci_results"):
+    """
+    Main TrimCI iterative workflow.
+    
+    This is a wrapper that calls the C++ implementation for maximum performance.
+    The C++ backend eliminates the overhead of C++ -> Python object conversion
+    for intermediate results (pool of millions of determinants).
+    
+    For the pure Python implementation (deprecated), use iterative_workflow_py().
+    
+    Args:
+        h1: One-body integrals (n_orb x n_orb)
+        eri: Two-body integrals (flattened or 4D)
+        n_alpha, n_beta: Number of alpha/beta electrons
+        n_orb: Number of orbitals
+        system_name: System identifier for logging and file naming
+        args: Configuration namespace with workflow parameters
+        nuclear_repulsion: Nuclear repulsion energy
+        start_time: Optional start time for timing (default: current time)
+        results_dir: Output directory
+    
+    Returns:
+        (final_energy, dets, coeffs, iteration_details, args)
+    """
+    import time
+    from pathlib import Path
+    
+    if start_time is None:
+        start_time = time.perf_counter()
+    
+    # Import C++ backend - select appropriate version based on n_orb
+    from trimci.trimci_core import IterativeWorkflowParams
+    from trimci.auto_selector import get_functions_for_system
+    
+    # Get the appropriate determinant type and functions
+    functions = get_functions_for_system(n_orb)
+    type_suffix = functions.get('type_suffix', '')
+    
+    # Import the correct iterative_workflow function
+    if not type_suffix or type_suffix == '':
+        # 64-bit (default)
+        from trimci.trimci_core import iterative_workflow_cpp
+    else:
+        # Scalable types (128-512)
+        import trimci.trimci_core as trimci_core
+        workflow_fn_name = f'iterative_workflow_cpp{type_suffix}'
+        if hasattr(trimci_core, workflow_fn_name):
+            iterative_workflow_cpp = getattr(trimci_core, workflow_fn_name)
+            log_important(f"Using scalable C++ workflow: {workflow_fn_name}")
+        else:
+            # Fallback to Python implementation if scalable C++ not available
+            log_important(f"⚠️ {workflow_fn_name} not available, falling back to Python workflow")
+            return iterative_workflow_py(h1, eri, n_alpha, n_beta, n_orb,
+                                         system_name, args, nuclear_repulsion,
+                                         start_time, results_dir)
+
+    
+    # Prepare ERI and h1 for C++ backend
+    # Use numpy arrays directly with the _np versions when available (faster for large systems)
+    use_numpy_version = False  # TEMPORARILY DISABLED - needs debugging
+    
+    if use_numpy_version:
+        # Keep as numpy arrays - use _np version of workflow
+        if hasattr(eri, "reshape") and hasattr(eri, "ndim") and eri.ndim == 4:
+            eri_np = eri.reshape(-1).astype(np.float64, copy=False)
+        else:
+            eri_np = np.asarray(eri, dtype=np.float64).flatten()
+        
+        h1_np = np.asarray(h1, dtype=np.float64)
+        
+        # Try to get numpy-optimized workflow function
+        import trimci.trimci_core as trimci_core
+        if not type_suffix or type_suffix == '':
+            numpy_workflow_fn_name = 'iterative_workflow_cpp_np'
+        else:
+            numpy_workflow_fn_name = f'iterative_workflow_cpp_np{type_suffix}'
+        
+        if hasattr(trimci_core, numpy_workflow_fn_name):
+            iterative_workflow_cpp = getattr(trimci_core, numpy_workflow_fn_name)
+            log_verbose(f"Using numpy-optimized C++ workflow: {numpy_workflow_fn_name}")
+            eri = eri_np
+            h1 = h1_np
+        else:
+            # Fallback to list conversion
+            log_verbose(f"Numpy-optimized workflow not available, using list conversion")
+            eri = eri_np.tolist()
+            h1 = h1_np.tolist()
+    else:
+        # Original list-based path (slower for large systems)
+        if hasattr(eri, "reshape") and hasattr(eri, "ndim") and eri.ndim == 4:
+            eri = eri.reshape(-1).tolist()
+        elif hasattr(eri, "tolist"):
+            eri = eri.tolist()
+        
+        if hasattr(h1, "tolist"):
+            h1 = h1.tolist()
+    
+    # Create results directory
+    unique_ts = generate_unique_timestamp()
+    results_dir = str(Path(results_dir) / f"{system_name}_{unique_ts}")
+    Path(results_dir).mkdir(parents=True, exist_ok=True)
+    
+    # =========================================================================
+    # Build IterativeWorkflowParams from args
+    # =========================================================================
+    params = IterativeWorkflowParams()
+    
+    # Termination conditions
+    params.max_iterations = getattr(args, 'max_iterations', 
+                                   getattr(args, 'exp_max_iterations', 200000))
+    params.energy_threshold = getattr(args, 'energy_threshold',
+                                      getattr(args, 'exp_energy_threshold', 1e-12))
+    params.max_final_dets = getattr(args, 'max_final_dets', -1) or -1
+    
+    # Core set growth
+    _core_set_ratio = getattr(args, 'core_set_ratio', 2)
+    if isinstance(_core_set_ratio, (int, float)):
+        params.core_set_ratio = [float(_core_set_ratio)]
+    else:
+        params.core_set_ratio = [float(r) for r in _core_set_ratio]
+    
+    params.initial_pool_size = getattr(args, 'initial_pool_size', 100)
+    params.first_cycle_keep_size = getattr(args, 'first_cycle_keep_size', 10)
+    
+    # Core set schedule
+    _schedule = getattr(args, 'core_set_schedule', None)
+    if _schedule is not None:
+        params.core_set_schedule = list(_schedule)
+    
+    # Pool building
+    params.pool_core_ratio = getattr(args, 'pool_core_ratio', 10)
+    params.pool_build_strategy = getattr(args, 'pool_build_strategy', 'heat_bath')
+    params.threshold = getattr(args, 'threshold', 0.01)
+    params.threshold_decay = getattr(args, 'threshold_decay', 0.9)
+    params.max_rounds = getattr(args, 'max_rounds', 1)
+    params.strategy_factor = getattr(args, 'strategy_factor', -1)
+    params.pool_strict_target_size = getattr(args, 'pool_strict_target_size', False)
+    params.stagnation_limit = getattr(args, 'stagnation_limit', 3)
+    
+    _attentive = getattr(args, 'attentive_orbitals', None)
+    if _attentive is not None:
+        params.attentive_orbitals = list(_attentive)
+    
+    # DMRG-style noise
+    params.noise_strength = getattr(args, 'noise_strength', 0.0)
+    
+    # TRIM parameters
+    params.num_groups = getattr(args, 'num_groups', 10)
+    params.num_groups_ratio = getattr(args, 'num_groups_ratio', 0)
+    params.local_trim_keep_ratio = getattr(args, 'local_trim_keep_ratio',
+                                           getattr(args, 'keep_pool_to_next_core_ratio', 0))
+    params.keep_ratio = getattr(args, 'keep_ratio', 0.1)
+    
+    # Verbosity
+    params.verbosity = getattr(args, 'verbosity', 1)
+    
+    # Saving parameters
+    params.save_period = getattr(args, 'save_period', 1000000)  # Default: effectively disabled
+    params.save_pool = getattr(args, 'save_pool', False)
+    params.save_initial = getattr(args, 'save_initial', False)
+    params.output_dir = results_dir  # Use the results directory
+    
+    # =========================================================================
+    # Generate initial determinants
+    # =========================================================================
+    initial_dets_dict = getattr(args, 'initial_dets_dict', None)
+    load_initial_dets = getattr(args, 'load_initial_dets', False)
+    
+    if load_initial_dets:
+        # Load from file - check both dets_path and initial_dets_path (for orbopt compatibility)
+        dets_path = getattr(args, 'initial_dets_path', None) or getattr(args, 'dets_path', 'dets.npz')
+        dets_array_name = getattr(args, 'dets_array_name', 'dets')
+        initial_dets, initial_coeffs = load_initial_dets_from_file(
+            dets_path, core_set=(dets_array_name != 'dets'))
+        
+        # Handle load failure - fallback to HF reference (matches Python behavior)
+        if initial_dets is None or initial_coeffs is None:
+            log_important(f"⚠️ Failed to load from {dets_path}, falling back to HF reference")
+            ref_det = generate_reference_det(n_alpha, n_beta, n_orb)
+            initial_dets = [ref_det]
+            initial_coeffs = [1.0]
+        else:
+            # Apply top-k truncation if load_initial_dets_num is specified (matches Python behavior)
+            load_initial_dets_num = getattr(args, 'load_initial_dets_num', None)
+            if load_initial_dets_num is not None and load_initial_dets_num < len(initial_dets):
+                original_count = len(initial_dets)
+                sorted_idx = np.argsort(np.abs(initial_coeffs))[::-1][:load_initial_dets_num]
+                initial_dets = [initial_dets[i] for i in sorted_idx]
+                initial_coeffs = [initial_coeffs[i] for i in sorted_idx]
+                log_important(f"✅ Loaded top-{load_initial_dets_num} determinants (truncated from {original_count})")
+            else:
+                log_important(f"✅ Loaded {len(initial_dets)} determinants from {dets_path}")
+    elif initial_dets_dict is not None:
+        # Generate from dict
+        initial_dets, initial_coeffs = generate_initial_states(
+            n_alpha, n_beta, n_orb,
+            initial_dets_dict
+        )
+    else:
+        # Default: HF reference
+        ref_det = generate_reference_det(n_alpha, n_beta, n_orb)
+        initial_dets = [ref_det]
+        initial_coeffs = [1.0]
+    
+    # =========================================================================
+    # Call C++ backend
+    # =========================================================================
+    log_important(f"🚀 Starting C++ iterative_workflow with {len(initial_dets)} initial dets")
+    
+    cpp_result = iterative_workflow_cpp(
+        h1, eri, n_alpha, n_beta, n_orb,
+        system_name,
+        initial_dets, initial_coeffs,
+        nuclear_repulsion,
+        params
+    )
+    
+    if not cpp_result.success:
+        raise RuntimeError(f"C++ iterative_workflow failed: {cpp_result.error_message}")
+    
+    # =========================================================================
+    # Convert result to Python format
+    # =========================================================================
+    total_time = time.perf_counter() - start_time
+    
+    # Build iteration_details dict (compatible with Python version)
+    iteration_details = {
+        'iterations': [],
+        'total_time': cpp_result.total_time,
+        'final_energy': cpp_result.final_energy,
+        'final_core_energy': cpp_result.final_energy,
+        'final_core_dets_count': len(cpp_result.final_dets),
+        'final_raw_energy': cpp_result.final_energy,
+        'final_raw_dets_count': len(cpp_result.final_dets),
+        'final_electronic_energy': cpp_result.final_energy - nuclear_repulsion,
+        'final_dets_count': len(cpp_result.final_dets),
+        'converged': any(info.converged for info in cpp_result.iteration_history),
+        'total_iterations': cpp_result.total_iterations,
+        'n_electrons': n_alpha + n_beta,
+        'n_orbitals': n_orb,
+        'nuclear_repulsion': nuclear_repulsion,
+        'results_dir': results_dir
+    }
+    
+    # Convert iteration history
+    for info in cpp_result.iteration_history:
+        iteration_details['iterations'].append({
+            'iteration': info.iteration,
+            'core_set_size_before': info.core_set_size_before,
+            'target_pool_size': info.target_pool_size,
+            'actual_pool_size': info.actual_pool_size,
+            'final_threshold': info.final_threshold,
+            'pool_building_time': info.pool_building_time,
+            'trim_m': info.trim_m,
+            'trim_k': info.trim_k,
+            'raw_dets_count': info.raw_dets_count,
+            'raw_energy': info.raw_energy,
+            'energy_change': info.energy_change,
+            'converged': info.converged,
+            'core_set_size_after': info.core_set_size_after,
+            'iteration_time': info.iteration_time,
+            'cumulative_time': info.cumulative_time,
+        })
+    
+    # Save results
+    save_final_results(
+        cpp_result.final_energy,
+        list(cpp_result.final_dets),
+        list(cpp_result.final_coeffs),
+        iteration_details,
+        args,
+        outdir=results_dir
+    )
+    
+    log_important(f"✅ C++ iterative_workflow complete: E={cpp_result.final_energy:.8f}, "
+                  f"dets={len(cpp_result.final_dets)}, time={cpp_result.total_time:.2f}s")
+    
+    return (cpp_result.final_energy, 
+            list(cpp_result.final_dets), 
+            list(cpp_result.final_coeffs), 
+            iteration_details, 
+            args)

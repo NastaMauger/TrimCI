@@ -1,5 +1,4 @@
-#ifndef TRIMCI_CORE_HAMILTONIAN_HPP
-#define TRIMCI_CORE_HAMILTONIAN_HPP
+#pragma once
 
 #include <string>
 #include <tuple>
@@ -7,34 +6,159 @@
 #include <vector>
 #include <cstdint>
 #include "determinant.hpp"
-
-// Include scalable hamiltonian for template-based functionality
-#include "hamiltonian_scalable.hpp"
+#include "bit_compat.hpp"
 
 namespace trimci_core {
+namespace detail {
 
-// 把 "X x y z; Y ..." 转成分子式比如 "N2O"
+// Template-based bit manipulation utilities
+// Template-based bit manipulation utilities moved to bit_compat.hpp
+
+
+// Template-based creation/destruction sign calculation
+template<typename StorageType>
+int cre_des_sign_t(int p, int a, const StorageType& bitstring) {
+    if (p == a) return 1;
+    int low = std::min(p, a) + 1;
+    int high = std::max(p, a);
+    
+    int count = 0;
+    if constexpr (std::is_same_v<StorageType, uint64_t>) {
+        uint64_t mask = ((uint64_t(1) << high) - 1) ^ ((uint64_t(1) << low) - 1);
+        count = __builtin_popcountll(bitstring & mask);
+    } else {
+        // For array storage, count bits in the range [low, high)
+        for (int i = low; i < high; ++i) {
+            if (BitOps<StorageType>::get_bit(bitstring, i)) {
+                count++;
+            }
+        }
+    }
+    return (count % 2 == 0) ? 1 : -1;
+}
+
+} // namespace detail
+
+// Extract molecular formula from atom string
 std::string extract_mol_name(const std::string& atom_str);
 
-// Hij 缓存（key 用一对 Determinant）
-using HijCache = std::map<std::pair<Determinant, Determinant>, double>;
+// Template-based Hij cache for different determinant types
+template<typename StorageType>
+using HijCacheT = std::map<std::pair<DeterminantT<StorageType>, DeterminantT<StorageType>>, double>;
 
-// 加载或创建磁盘缓存
+// Backward compatibility
+using HijCache = HijCacheT<uint64_t>;
+
+// Load or create disk cache (template version)
+template<typename StorageType>
+std::tuple<HijCacheT<StorageType>, std::string>
+load_or_create_Hij_cache_t(const std::string& mol_name,
+                           int n_elec, int n_orb,
+                           const std::string& cache_dir = "cache");
+
+// Wrapper for backward compatibility
 std::tuple<HijCache, std::string>
 load_or_create_Hij_cache(const std::string& mol_name,
                          int n_elec, int n_orb,
                          const std::string& cache_dir = "cache");
 
-// 对称化 key 保证 (i,j) 与 (j,i) 同一 entry
+// Template-based pair key function for cache
+template<typename StorageType>
+std::pair<DeterminantT<StorageType>, DeterminantT<StorageType>>
+pair_key_t(const DeterminantT<StorageType>& d1, const DeterminantT<StorageType>& d2);
+
+// Wrapper for backward compatibility
 std::pair<Determinant, Determinant>
 pair_key(const Determinant& d1, const Determinant& d2);
 
-// 计算 Slater–Condon 矩阵元素 ⟨D_i|H|D_j⟩
+// Helper to access flattened ERI
+// eri[i][j][k][l] -> eri[((i*n + j)*n + k)*n + l]
+// Note: Uses size_t to avoid integer overflow for n_orb >= 256 (256^4 > INT_MAX)
+inline double get_eri(const std::vector<double>& eri, int n, int i, int j, int k, int l) {
+    size_t idx = ((static_cast<size_t>(i) * n + j) * n + k) * n + l;
+    return eri[idx];
+}
+
+
+// =============================================================================
+// Integral Sparsity Info (auto-detected, transparent optimization)
+// =============================================================================
+struct IntegralSparsityInfo {
+    // h1_neighbors[i] = sorted list of j where |h1[i][j]| > threshold (i != j)
+    std::vector<std::vector<int>> h1_neighbors;
+
+    // ab_exc_table[i] = list of (j, p, q, eri(i,p,j,q)) for non-zero entries
+    // i = alpha orbital index; j = beta occ, p = alpha virt, q = beta virt
+    using ABEntry = std::tuple<int, int, int, double>;
+    std::vector<std::vector<ABEntry>> ab_exc_table;
+
+    bool eri_is_diagonal = false;  // true if only (ii|ii) ERIs are non-zero
+    bool is_sparse = false;        // true if sparsity paths should be used
+    double h1_sparsity = 1.0;     // fraction of non-zero h1 off-diagonal
+    double eri_sparsity = 1.0;    // fraction of non-zero ERI
+};
+
+/// Build sparsity info from integrals (one-time O(n^4) cost).
+IntegralSparsityInfo build_sparsity_info(
+    int n_orb,
+    const std::vector<std::vector<double>>& h1,
+    const std::vector<double>& eri,
+    double threshold = 1e-14);
+
+// Template-based Slater-Condon matrix element computation
+template<typename StorageType>
+double compute_H_ij_t(const DeterminantT<StorageType>& det_i,
+                      const DeterminantT<StorageType>& det_j,
+                      const std::vector<std::vector<double>>& h1,
+                      const std::vector<double>& eri);
+
+// Overload with sparsity fast paths
+template<typename StorageType>
+double compute_H_ij_t(const DeterminantT<StorageType>& det_i,
+                      const DeterminantT<StorageType>& det_j,
+                      const std::vector<std::vector<double>>& h1,
+                      const std::vector<double>& eri,
+                      const IntegralSparsityInfo* sparsity);
+
+// Wrapper for backward compatibility
 double compute_H_ij(const Determinant& det_i,
                     const Determinant& det_j,
                     const std::vector<std::vector<double>>& h1,
-                    const std::vector<std::vector<std::vector<std::vector<double>>>>& eri);
+                    const std::vector<double>& eri);
+
+// =============================================================================
+// CI Energy Evaluation
+// =============================================================================
+
+/**
+ * @brief Evaluate CI energy given determinants and coefficients.
+ * 
+ * Computes E = Σ_ij c_i c_j ⟨D_i|H|D_j⟩ using Slater-Condon rules.
+ * 
+ * @param dets_alpha Alpha bitstrings for each determinant
+ * @param dets_beta Beta bitstrings for each determinant
+ * @param coeffs CI coefficients
+ * @param h1 One-body integrals (n_orb x n_orb)
+ * @param eri Two-body integrals (flattened n_orb^4)
+ * @param n_orb Number of orbitals
+ * @return CI energy
+ */
+double evaluate_ci_energy(
+    const std::vector<uint64_t>& dets_alpha,
+    const std::vector<uint64_t>& dets_beta,
+    const std::vector<double>& coeffs,
+    const std::vector<std::vector<double>>& h1,
+    const std::vector<double>& eri,
+    int n_orb);
+
+/**
+ * @brief Template version of evaluate_ci_energy for different storage types.
+ */
+template<typename StorageType>
+double evaluate_ci_energy_t(
+    const std::vector<DeterminantT<StorageType>>& dets,
+    const std::vector<double>& coeffs,
+    const std::vector<std::vector<double>>& h1,
+    const std::vector<double>& eri);
 
 } // namespace trimci_core
-
-#endif // TRIMCI_CORE_HAMILTONIAN_HPP

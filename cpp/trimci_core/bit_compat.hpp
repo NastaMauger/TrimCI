@@ -37,3 +37,81 @@
   inline int popcount64(unsigned long long x) { return __builtin_popcountll(x); }
   inline int ctz64(unsigned long long x)      { return __builtin_ctzll(x); }
 #endif
+
+namespace trimci_core {
+namespace detail {
+
+template<typename StorageType>
+struct HamiltonianBitOps {
+    static int count_differences(const StorageType& a, const StorageType& b) {
+        if constexpr (std::is_same_v<StorageType, uint64_t>) {
+            return popcount64(a ^ b);
+        } else {
+            int count = 0;
+            for(size_t i=0; i<a.size(); ++i) {
+                count += popcount64(a[i] ^ b[i]);
+            }
+            return count;
+        }
+    }
+
+    static std::vector<int> storage_to_indices(const StorageType& s) {
+        std::vector<int> indices;
+        if constexpr (std::is_same_v<StorageType, uint64_t>) {
+            uint64_t temp = s;
+            while(temp) {
+                int p = ctz64(temp);
+                indices.push_back(p);
+                temp &= ~(1ULL << p);
+            }
+        } else {
+            for(size_t i=0; i<s.size(); ++i) {
+                uint64_t temp = s[i];
+                while(temp) {
+                    int p = ctz64(temp) + i * 64;
+                    indices.push_back(p);
+                    temp &= ~(1ULL << ctz64(temp));
+                }
+            }
+        }
+        return indices;
+    }
+
+    static int storage_to_indices_inline(const StorageType& s, int* buffer, int capacity) {
+        int count = 0;
+        if constexpr (std::is_same_v<StorageType, uint64_t>) {
+            uint64_t temp = s;
+            while(temp) {
+                if (count >= capacity) return count; // Safety break
+                int p = ctz64(temp);
+                buffer[count++] = p;
+                temp &= ~(1ULL << p);
+            }
+        } else {
+             for(size_t i=0; i<s.size(); ++i) {
+                uint64_t temp = s[i];
+                while(temp) {
+                    if (count >= capacity) return count;
+                    int p = ctz64(temp);
+                    buffer[count++] = p + i * 64;
+                    // Note: need to clear the bit we just found to advance
+                    temp &= ~(1ULL << p);
+                }
+            }
+        }
+        return count;
+    }
+    
+    static StorageType and_not(const StorageType& a, const StorageType& b) {
+        if constexpr (std::is_same_v<StorageType, uint64_t>) {
+             return a & (~b);
+        } else {
+             StorageType res;
+             for(size_t i=0; i<a.size(); ++i) res[i] = a[i] & (~b[i]);
+             return res;
+        }
+    }
+};
+
+} // namespace detail
+} // namespace trimci_core

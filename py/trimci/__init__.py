@@ -54,7 +54,7 @@ from .auto_selector import (
     print_system_recommendation,
 )
 
-from .TrimCI_runner.trimci_driver import run_full_calculation, read_fcidump
+from .TrimCI_runner.trimci_driver import run_full_calculation, read_fcidump, run_full, run_auto
 
 __all__ = [
     "extract_mol_name",
@@ -73,6 +73,5 @@ __all__ = [
     "print_system_recommendation",
     "run_full_calculation",
     "run_auto",
-    "cli_main",
     "read_fcidump",
 ]

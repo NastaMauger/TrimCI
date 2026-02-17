@@ -1,15 +1,49 @@
-// screening.hpp
 #pragma once
 
 #include <vector>
 #include <unordered_map>
 #include <tuple>
+#include <array>
+#include <string>
 #include "determinant.hpp"
 #include "hamiltonian.hpp"
 
 namespace trimci_core {
 
-// 双激发表的 key 和哈希
+// Pool building parameters structure
+// Contains tunable parameters for the pool building algorithm
+struct PoolBuildParams {
+    // Screening strategy
+    std::string screening_mode = "heat_bath";  // "heat_bath", "heat_bath_pt2", "pt2"
+    double e0 = 0.0;  // reference energy for PT2 denominator
+    
+    // Expansion control
+    int max_rounds = 2;           // rounds per threshold level
+    double threshold_decay = 0.5; // threshold reduction factor
+    double min_threshold = 1e-10; // minimum threshold
+    int max_stagnant_rounds = 1000; // max rounds without progress
+    
+    // Strategy factor: controls pre-filter size for PT2 modes
+    // -1 = automatic (1 for heat_bath, 20 for PT2 modes)
+    // User can override to any positive value
+    int strategy_factor = -1;
+    
+    // PT2 specific
+    double pt2_denom_min = 1e-10; // minimum denominator to avoid intruder states
+    
+    // Strict target size: if true, truncate pool to exactly target_size
+    // This gives better time control at the cost of potentially missing important dets
+    bool strict_target_size = false;
+};
+
+// Screening mode (string-based for extensibility)
+// Supported modes:
+// - "heat_bath": Use |H_ij * c_i| for screening (default, fast)
+// - "heat_bath_pt2": Use |H_ij * c_i| / |E_0 - H_jj| for screening (includes PT2 denominator)
+// - "pt2": Use |sum_i H_ij * c_i|^2 / |E_0 - H_jj| for screening (full PT2 estimation)
+// Additional modes can be added in the future without ABI changes
+
+// Double excitation table key and hash
 using ExcTableKey = std::pair<int,int>;
 struct PairHash {
     size_t operator()(ExcTableKey const& p) const noexcept {
@@ -24,14 +58,58 @@ using DoubleExcTable =
                        std::vector<std::tuple<int,int,double>>,
                        PairHash>;
 
-// 预计算双激发表：筛选 |h|>thr，按 |h| 降序
+// Precompute double excitation table: filter |h|>thr, sort by |h| desc
+// If attentive_orbitals is non-empty, only include orbitals in that set
 DoubleExcTable precompute_double_exc_table(
     int n_orb,
-    const std::vector<std::vector<std::vector<std::vector<double>>>>& eri,
-    double thr
+    const std::vector<double>& eri,
+    double thr,
+    const std::vector<int>& attentive_orbitals = {}
 );
 
-// 处理单个父行列式，返回所有 |H_ij|>thr 的 (det, hij)
+namespace detail {
+
+template<typename StorageType>
+int single_phase_t(const StorageType& storage, int i, int p) {
+    // Use Hamiltonian's cre_des_sign_t
+    return trimci_core::detail::cre_des_sign_t(p, i, storage);
+}
+
+template<typename StorageType>
+int double_phase_t(const StorageType& storage, int i, int j, int p, int q) {
+    // i, j are occupied; p, q are virtual
+    // Phase for a_p^dag a_i (removing i, adding p)
+    int ph1 = trimci_core::detail::cre_des_sign_t(p, i, storage);
+    
+    // Intermediate storage
+    StorageType tmp = storage;
+    BitOps<StorageType>::clear_bit(tmp, i);
+    BitOps<StorageType>::set_bit(tmp, p);
+    
+    // Phase for a_q^dag a_j (removing j, adding q)
+    int ph2 = trimci_core::detail::cre_des_sign_t(q, j, tmp);
+    
+    return ph1 * ph2;
+}
+
+} // namespace detail
+
+// Template function declarations
+// If attentive_orbitals is non-empty, excitations are restricted to those orbitals
+template<typename StorageType>
+std::vector<std::pair<DeterminantT<StorageType>, double>>
+process_parent_worker_t(
+    const DeterminantT<StorageType>& det,
+    int n_orb,
+    double thr,
+    const DoubleExcTable& table,
+    const std::vector<std::vector<double>>& h1,
+    const std::vector<double>& eri,
+    const std::unordered_set<int>& attentive_set = {},
+    const IntegralSparsityInfo* sparsity = nullptr
+);
+
+// Wrapper for backward compatibility
 std::vector<std::pair<Determinant,double>>
 process_parent_worker(
     const Determinant& det,
@@ -39,22 +117,45 @@ process_parent_worker(
     double thr,
     const DoubleExcTable& table,
     const std::vector<std::vector<double>>& h1,
-    const std::vector<std::vector<std::vector<std::vector<double>>>>& eri
+    const std::vector<double>& eri
 );
 
-// 优化后的并行筛选主流程：直接返回完整的池和调整后的threshold，避免Python端的列表拼接
+// Template-based pool building function
+// attentive_orbitals: if non-empty, excitations are restricted to these orbital indices
+// params: PoolBuildParams struct containing algorithm parameters
+template<typename StorageType>
+std::pair<std::vector<DeterminantT<StorageType>>, double>
+pool_build_t(
+    const std::vector<DeterminantT<StorageType>>& initial_pool,
+    const std::vector<double>& initial_coeff,
+    int n_orb,
+    const std::vector<std::vector<double>>& h1,
+    const std::vector<double>& eri,
+    double threshold,
+    size_t target_size,
+    HijCacheT<StorageType>& cache,
+    const std::string& cache_file,
+    const std::vector<int>& attentive_orbitals,
+    int verbosity,
+    const PoolBuildParams& params = {}
+);
+
+// Wrapper for backward compatibility
 std::pair<std::vector<Determinant>, double>
 pool_build(
     const std::vector<Determinant>& initial_pool,
     const std::vector<double>& initial_coeff,
     int n_orb,
     const std::vector<std::vector<double>>& h1,
-    const std::vector<std::vector<std::vector<std::vector<double>>>>& eri,
+    const std::vector<double>& eri,
     double threshold,
     size_t target_size,
     HijCache& cache,
     const std::string& cache_file,
-    int max_rounds = -1
+    int max_rounds = -1,
+    double threshold_decay = 0.9,
+    const std::vector<int>& attentive_orbitals = {},
+    int verbosity = 1
 );
 
 } // namespace trimci_core
