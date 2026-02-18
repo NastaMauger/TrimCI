@@ -7,6 +7,8 @@
 
 # TrimCI
 
+> 🔥 **v0.1.2 (Feb 2026):** Workflow and codebase optimizations throughout — 4–15x faster. Just `pip install trimci`.
+
 **Trimmed Configuration Interaction (TrimCI)** is a **high-performance** framework for quantum many-body and quantum chemistry calculation.  
 It constructs accurate ground states *directly from random Slater determinants* — without any guiding ansatz, Hartree–Fock reference, or prior human knowledge — through an iterative expansion–trimming cycle on the determinant graph.  
 
